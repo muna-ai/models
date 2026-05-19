@@ -5,14 +5,14 @@
 
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["huggingface_hub", "muna", "onnxruntime", "rich", "torchvision"]
+# dependencies = ["ai-edge-litert", "huggingface_hub", "muna", "rich", "torchvision"]
 # ///
 
+from ai_edge_litert.interpreter import Interpreter
 from huggingface_hub import hf_hub_download
 from muna import compile, Parameter, Sandbox
-from muna.beta import OnnxRuntimeInferenceSessionMetadata
+from muna.beta import TFLiteInterpreterMetadata
 from numpy import array, ndarray
-from onnxruntime import InferenceSession
 from pathlib import Path
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -40,15 +40,22 @@ class Pose(BaseModel):
     confidence: float = Field(description="Pose confidence score in range [0, 1].")
     keypoints: list[Keypoint] = Field(description="Pose keypoints.")
 
-model_path = hf_hub_download("Xenova/movenet-multipose-lightning", "onnx/model.onnx")
-model = InferenceSession(model_path)
+model_path = hf_hub_download("muna-ai/natml-hub", "movenet-multipose-lightning-256-fp16-cle.tflite")
+model = Interpreter(model_path)
+model.allocate_tensors()
+input_idx = model.get_input_details()[0]["index"]
+output_idx = model.get_output_details()[0]["index"]
 
 @compile(
     sandbox=Sandbox()
         .pip_install("torchvision", index_url="https://download.pytorch.org/whl/cpu")
-        .pip_install("huggingface_hub", "onnxruntime"),
+        .pip_install("ai-edge-litert", "huggingface_hub"),
     metadata=[
-        OnnxRuntimeInferenceSessionMetadata(session=model, model_path=model_path)
+        TFLiteInterpreterMetadata(
+            interpreter=model,
+            model_path=model_path,
+            options=["xnnpack_force_fp16"],
+        )
     ]
 )
 def movenet_multipose(
@@ -69,11 +76,13 @@ def movenet_multipose(
     Detect poses in an image with MoveNet Multipose.
     """
     # Preprocess image
-    image = F.resize(image, [192, 192])
+    image = F.resize(image, [256, 256])
     image = image.convert("RGB")
-    image_tensor = array(image).astype("int32")
+    image_tensor = array(image, dtype="uint8")[None]
     # Run model
-    logits = model.run(None, { "input": image_tensor[None] })[0] # (1,6,56)
+    model.set_tensor(input_idx, image_tensor)
+    model.invoke()
+    logits = model.get_tensor(output_idx) # (1,6,56)
     # Parse poses
     valid_pose_mask = logits[0,:,55] >= min_confidence
     valid_pose_data = logits[0,valid_pose_mask] # (N,56)
