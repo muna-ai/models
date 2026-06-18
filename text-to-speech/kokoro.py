@@ -87,7 +87,6 @@ if not kokoro_voices_path.exists():
 voices = load(kokoro_voices_path)
 
 @compile(
-    tag="@hexgrad/kokoro-tts",
     sandbox=Sandbox().pip_install("huggingface_hub", "numpy", "onnxruntime"),
     metadata=[
         OnnxRuntimeInferenceSessionMetadata(session=kokoro, model_path=kokoro_model_path),

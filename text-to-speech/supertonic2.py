@@ -5,7 +5,7 @@
 
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["huggingface_hub", "muna", "numpy", "onnxruntime", "sounddevice"]
+# dependencies = ["huggingface_hub", "muna", "onnxruntime", "sounddevice"]
 # ///
 
 from huggingface_hub import hf_hub_download
@@ -112,7 +112,7 @@ SYMBOL_REPLACEMENTS: list[tuple[str, str]] = [
 ]
 
 @compile(
-    sandbox=Sandbox().pip_install("huggingface_hub", "numpy", "onnxruntime"),
+    sandbox=Sandbox().pip_install("huggingface_hub", "onnxruntime"),
     metadata=[
         OnnxRuntimeInferenceSessionMetadata(session=dp_session, model_path=dp_model_path),
         OnnxRuntimeInferenceSessionMetadata(session=text_enc_session, model_path=text_enc_model_path),
@@ -205,9 +205,8 @@ def _preprocess_text(text: str, lang: str) -> str:
     # Add period if needed
     if len(text) > 0 and text[-1] not in ".!?;:,'\"')]}>":
         text = text + "."
-    # Add language tags (use concatenation to avoid codegen issue with duplicate f-string vars)
-    text = "<" + lang + ">" + text + "</" + lang + ">"
-    return text
+    # Add language tags
+    return f"<{lang}>{text}</{lang}>"
 
 def _encode_text(text_list: list[str]) -> tuple[ndarray, ndarray]:
     """

@@ -27,10 +27,10 @@ KEYPOINTS = [
 ]
 
 class Keypoint(BaseModel):
-    x: float = Field("Normalized X position.")
-    y: float = Field("Normalized Y position.")
+    x: float = Field(description="Normalized X position.")
+    y: float = Field(description="Normalized Y position.")
     label: str = Field(description="Keypoint label.")
-    confidence: float = Field("Normalized keypoint confidence score.")
+    confidence: float = Field(description="Normalized keypoint confidence score.")
 
 class Pose(BaseModel):
     x: float = Field(description="Normalized minimum point X coordinate.")
