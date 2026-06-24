@@ -62,10 +62,7 @@ with suppress_init_weights(), init_empty_weights():
 # Create the continuous batching manager
 generation_config = GenerationConfig(
     max_new_tokens=2048,
-    eos_token_id=[
-        tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|im_end|>")
-    ],
+    eos_token_id=config.eos_token_id,
     pad_token_id=tokenizer.pad_token_id,
     do_sample=True,
     temperature=0.7,
