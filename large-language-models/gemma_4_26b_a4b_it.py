@@ -79,7 +79,6 @@ manager = model.init_continuous_batching(
 )
 
 @compile(
-    access="unlisted",
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
     sandbox=Sandbox()
         .pip_install("accelerate", "nvidia-modelopt", "tiktoken", "torch", "transformers>=5.7"),
