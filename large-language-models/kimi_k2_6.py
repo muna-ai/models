@@ -14,7 +14,7 @@
 from accelerate import init_empty_weights
 from contextlib import contextmanager
 from muna import compile, BatchConfig, Parameter, Sandbox
-from muna.beta import Annotations, SGLangInferenceMetadata, SpeculativeDecodingConfig
+from muna.beta import Annotations, SGLangInferenceMetadata
 from muna.beta.openai import (
     ChatCompletion, ChatCompletionChunk, DeltaMessage,
     Message, StreamChoice
@@ -53,25 +53,14 @@ def force_eager_attn(cfg):
     _walk(cfg)
     yield cfg
 
-# Load the Kimi K2.5 model
+# Load the Kimi K2.6 model
 # We instantiate the model on the meta device to skip a ~500GB download
-CHECKPOINT = "nvidia/Kimi-K2.5-NVFP4"
+CHECKPOINT = "nvidia/Kimi-K2.6-NVFP4"
 config = AutoConfig.from_pretrained(CHECKPOINT, trust_remote_code=True)
 tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT, trust_remote_code=True)
 with force_eager_attn(config), suppress_init_weights(), init_empty_weights():
     model = AutoModelForCausalLM.from_config(
         config,
-        trust_remote_code=True,
-        attn_implementation="eager",
-    )
-
-# Load the DFlash draft model
-# Same as above, instantiate on the meta device
-DRAFT_CHECKPOINT = "z-lab/Kimi-K2.5-DFlash"
-draft_config = AutoConfig.from_pretrained(DRAFT_CHECKPOINT, trust_remote_code=True)
-with force_eager_attn(draft_config), suppress_init_weights(), init_empty_weights():
-    draft_model = AutoModelForCausalLM.from_config(
-        draft_config,
         trust_remote_code=True,
         attn_implementation="eager",
     )
@@ -100,7 +89,7 @@ manager = model.init_continuous_batching(
 )
 
 @compile(
-    targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
+    targets=["x86_64-unknown-linux-gnu"], # Linux x64 + CUDA only
     sandbox=Sandbox().pip_install(
         "accelerate", "nvidia-modelopt", "tiktoken",
         "torch", "transformers>=5.7"
@@ -110,16 +99,12 @@ manager = model.init_continuous_batching(
             model=model,
             compute_architecture="sm_100",  # Compile for Blackwell
             tensor_parallelism=4,           # Run on 4xB200
-            speculative_decoding=SpeculativeDecodingConfig(
-                draft_model=draft_model,
-                num_draft_tokens=8,         # Draft tokens per step
-            ),
             max_running_requests=4,
             max_total_tokens=32_768
         )
     ]
 )
-def kimi_k2_5(
+def kimi_k2_6(
     messages: Annotated[list[Message], Parameter.Generic(
         description="Messages comprising the conversation so far.",
         batch=BatchConfig(mode="continuous")
@@ -142,7 +127,7 @@ def kimi_k2_5(
     )]=0.95,
 ) -> Iterator[ChatCompletionChunk]:
     """
-    Stream chat completions from Kimi K2.5 (NVFP4).
+    Stream chat completions from Kimi K2.6 (NVFP4).
     """
     # Tokenize message history
     input_ids = tokenizer.apply_chat_template(
@@ -238,7 +223,7 @@ if __name__ == "__main__":
         Message(role="system", content="You are Kimi, a helpful AI assistant."),
         Message(role="user", content="What is the capital of France?"),
     ]
-    for chunk in kimi_k2_5(chat_messages):
+    for chunk in kimi_k2_6(chat_messages):
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
             print(chunk.choices[0].delta.content, end="", flush=True)
     print()

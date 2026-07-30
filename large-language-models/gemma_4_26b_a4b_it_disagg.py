@@ -14,7 +14,7 @@
 from accelerate import init_empty_weights
 from contextlib import contextmanager
 from muna import compile, BatchConfig, Parameter, Sandbox
-from muna.beta import Annotations, SGLangInferenceMetadata, SpeculativeDecodingConfig
+from muna.beta import Annotations, SGLangDisaggregationConfig, TorchToSGLangInferenceMetadata
 from muna.beta.openai import (
     ChatCompletion, ChatCompletionChunk, DeltaMessage,
     Message, StreamChoice
@@ -27,11 +27,6 @@ from transformers.modeling_utils import PreTrainedModel
 from typing import Annotated, Iterator
 from uuid import uuid4
 
-# Patch transformers since model was written for 4.x but we need >5.0 for continuous batching
-from transformers.utils import import_utils as _t_import_utils
-if not hasattr(_t_import_utils, "is_torch_fx_available"):
-    _t_import_utils.is_torch_fx_available = lambda: False
-
 # Helpers for loading the model in transformers v5
 @contextmanager
 def suppress_init_weights():
@@ -42,47 +37,21 @@ def suppress_init_weights():
     finally:
         PreTrainedModel.init_weights = saved
 
-@contextmanager
-def force_eager_attn(cfg):
-    def _walk(c):
-        if hasattr(c, "_attn_implementation"):
-            c._attn_implementation = "eager"
-        for sub in vars(c).values():
-            if hasattr(sub, "_attn_implementation"):
-                _walk(sub)
-    _walk(cfg)
-    yield cfg
-
-# Load the Kimi K2.5 model
-# We instantiate the model on the meta device to skip a ~500GB download
-CHECKPOINT = "nvidia/Kimi-K2.5-NVFP4"
+# Load the Gemma 4 model
+# We instantiate the model on the meta device to skip a ~52GB download
+CHECKPOINT = "google/gemma-4-26B-A4B-it"
 config = AutoConfig.from_pretrained(CHECKPOINT, trust_remote_code=True)
 tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT, trust_remote_code=True)
-with force_eager_attn(config), suppress_init_weights(), init_empty_weights():
+with suppress_init_weights(), init_empty_weights():
     model = AutoModelForCausalLM.from_config(
         config,
         trust_remote_code=True,
-        attn_implementation="eager",
-    )
-
-# Load the DFlash draft model
-# Same as above, instantiate on the meta device
-DRAFT_CHECKPOINT = "z-lab/Kimi-K2.5-DFlash"
-draft_config = AutoConfig.from_pretrained(DRAFT_CHECKPOINT, trust_remote_code=True)
-with force_eager_attn(draft_config), suppress_init_weights(), init_empty_weights():
-    draft_model = AutoModelForCausalLM.from_config(
-        draft_config,
-        trust_remote_code=True,
-        attn_implementation="eager",
     )
 
 # Create the continuous batching manager
 generation_config = GenerationConfig(
     max_new_tokens=2048,
-    eos_token_id=[
-        tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|im_end|>")
-    ],
+    eos_token_id=config.eos_token_id,
     pad_token_id=tokenizer.pad_token_id,
     do_sample=True,
     temperature=0.7,
@@ -91,7 +60,6 @@ generation_config = GenerationConfig(
 )
 batching_config = ContinuousBatchingConfig(
     per_request_processors=True,
-    use_cuda_graph=True,
     max_memory_percent=0.9,
 )
 manager = model.init_continuous_batching(
@@ -101,25 +69,21 @@ manager = model.init_continuous_batching(
 
 @compile(
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
-    sandbox=Sandbox().pip_install(
-        "accelerate", "nvidia-modelopt", "tiktoken",
-        "torch", "transformers>=5.7"
-    ),
+    sandbox=Sandbox()
+        .pip_install("accelerate", "nvidia-modelopt", "tiktoken", "torch", "transformers>=5.7"),
     metadata=[
-        SGLangInferenceMetadata(
+        TorchToSGLangInferenceMetadata(
             model=model,
-            compute_architecture="sm_100",  # Compile for Blackwell
-            tensor_parallelism=4,           # Run on 4xB200
-            speculative_decoding=SpeculativeDecodingConfig(
-                draft_model=draft_model,
-                num_draft_tokens=8,         # Draft tokens per step
+            compute_architecture="sm_100",  # Blackwell only
+            disaggregation=SGLangDisaggregationConfig(
+                topology="intra_node",      # Prefill and decode on separate GPUs
             ),
-            max_running_requests=4,
+            max_running_requests=8,
             max_total_tokens=32_768
         )
     ]
 )
-def kimi_k2_5(
+def gemma_4_26b_a4b_it_disagg(
     messages: Annotated[list[Message], Parameter.Generic(
         description="Messages comprising the conversation so far.",
         batch=BatchConfig(mode="continuous")
@@ -142,7 +106,7 @@ def kimi_k2_5(
     )]=0.95,
 ) -> Iterator[ChatCompletionChunk]:
     """
-    Stream chat completions from Kimi K2.5 (NVFP4).
+    Stream chat completions from Gemma 4 26B with disaggregated prefill/decode.
     """
     # Tokenize message history
     input_ids = tokenizer.apply_chat_template(
@@ -154,9 +118,7 @@ def kimi_k2_5(
     completion_id = f"chatcmpl-{uuid4()}"
     created = int(time())
     prompt_tokens = len(input_ids)
-    # Submit the request to the shared batching manager. Other concurrent calls
-    # to this predictor add their own requests in parallel; the manager merges
-    # them all into the next forward step.
+    # Submit the request to the shared batching manager
     manager.add_request(
         input_ids=input_ids,
         request_id=completion_id,
@@ -232,13 +194,3 @@ def kimi_k2_5(
         # Handle finish with content
         if finished:
             break
-
-if __name__ == "__main__":
-    chat_messages = [
-        Message(role="system", content="You are Kimi, a helpful AI assistant."),
-        Message(role="user", content="What is the capital of France?"),
-    ]
-    for chunk in kimi_k2_5(chat_messages):
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            print(chunk.choices[0].delta.content, end="", flush=True)
-    print()

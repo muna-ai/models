@@ -46,7 +46,6 @@ with suppress_init_weights(), init_empty_weights():
     model = AutoModelForCausalLM.from_config(
         config,
         trust_remote_code=True,
-        #attn_implementation="eager",
     )
 
 # Load the draft model
@@ -56,7 +55,6 @@ with suppress_init_weights(), init_empty_weights():
     draft_model = AutoModelForCausalLM.from_config(
         draft_config,
         trust_remote_code=True,
-        #attn_implementation="eager",
     )
 
 # Create the continuous batching manager
@@ -88,8 +86,7 @@ manager = model.init_continuous_batching(
             compute_architecture="sm_100",  # Blackwell only
             speculative_decoding=SpeculativeDecodingConfig(
                 draft_model=draft_model,
-                num_draft_tokens=8,         # number of draft tokens to generate per step
-                ddtree_node_budget=0        # >1 enables DDTree on DFlash
+                num_draft_tokens=8,         # Draft tokens per step
             ),
             max_running_requests=8,
             max_total_tokens=32_768
@@ -97,13 +94,10 @@ manager = model.init_continuous_batching(
     ]
 )
 def gemma_4_26b_a4b_it(
-    messages: Annotated[
-        list[Message],
-        Parameter.Generic(
-            description="Messages comprising the conversation so far.",
-            batch=BatchConfig(mode="continuous")
-        )
-    ],
+    messages: Annotated[list[Message], Parameter.Generic(
+        description="Messages comprising the conversation so far.",
+        batch=BatchConfig(mode="continuous")
+    )],
     *,
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
