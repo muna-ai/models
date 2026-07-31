@@ -31,32 +31,13 @@ GenerationVoice = Literal[
 ]
 
 # Download model files from HuggingFace
-dp_model_path = hf_hub_download(
-    repo_id="Supertone/supertonic-2",
-    filename="onnx/duration_predictor.onnx"
-)
-text_enc_model_path = hf_hub_download(
-    repo_id="Supertone/supertonic-2",
-    filename="onnx/text_encoder.onnx"
-)
-vector_est_model_path = hf_hub_download(
-    repo_id="Supertone/supertonic-2",
-    filename="onnx/vector_estimator.onnx"
-)
-vocoder_model_path = hf_hub_download(
-    repo_id="Supertone/supertonic-2",
-    filename="onnx/vocoder.onnx"
-)
-
-# Download configuration files
-config_path = hf_hub_download(
-    repo_id="Supertone/supertonic-2",
-    filename="onnx/tts.json"
-)
-unicode_indexer_path = hf_hub_download(
-    repo_id="Supertone/supertonic-2",
-    filename="onnx/unicode_indexer.json"
-)
+REPO_ID = "Supertone/supertonic-2"
+dp_model_path = hf_hub_download(REPO_ID, "onnx/duration_predictor.onnx")
+text_enc_model_path = hf_hub_download(REPO_ID, "onnx/text_encoder.onnx")
+vector_est_model_path = hf_hub_download(REPO_ID, "onnx/vector_estimator.onnx")
+vocoder_model_path = hf_hub_download(REPO_ID, "onnx/vocoder.onnx")
+config_path = hf_hub_download(REPO_ID, "onnx/tts.json")
+unicode_indexer_path = hf_hub_download(REPO_ID, "onnx/unicode_indexer.json")
 
 # Load ONNX models
 dp_session = InferenceSession(dp_model_path)
