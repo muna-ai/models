@@ -66,7 +66,6 @@ generation_config = GenerationConfig(
     pad_token_id=tokenizer.pad_token_id,
     do_sample=True,
     temperature=0.7,
-    top_p=0.95,
     top_k=50,
 )
 batching_config = ContinuousBatchingConfig(
@@ -118,11 +117,6 @@ def glm_5_2(
         min=0.0,
         max=2.0
     )]=0.7,
-    top_p: Annotated[float, Annotations.SamplingProbability(
-        description="Nucleus sampling probability.",
-        min=0.0,
-        max=1.0
-    )]=0.95,
 ) -> Iterator[ChatCompletionChunk]:
     """
     Stream chat completions from GLM 5.2 (NVFP4).
@@ -145,8 +139,7 @@ def glm_5_2(
         request_id=completion_id,
         streaming=True,
         max_new_tokens=max_output_tokens,
-        temperature=temperature,
-        top_p=top_p,
+        temperature=temperature
     )
     # First chunk announces the assistant role with no content, mirroring the
     # OpenAI streaming protocol.
