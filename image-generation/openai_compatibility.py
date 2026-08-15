@@ -17,12 +17,12 @@ from typing import Annotated
 
 image_response = get(
     "https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg",
-    headers={ "User-Agent": "py2cpp-image-compatibility-test/1.0" },
+    headers={ "User-Agent": "muna/1.0" },
 )
 image = Image.open(BytesIO(image_response.content))
 
 @compile()
-def fake_image_model(
+def image_model(
     prompt: Annotated[list[str], Parameter.Generic(
         description="Text descriptions of the desired images.",
         batch=BatchConfig(mode="dynamic", capacity=4)

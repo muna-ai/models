@@ -76,7 +76,7 @@ manager = model.init_continuous_batching(
             model=model,
             compute_architecture="sm_100",  # Blackwell only
             disaggregation=SGLangDisaggregationConfig(
-                topology="intra_node",      # Prefill and decode on separate GPUs
+                topology="inter_node",      # Prefill and decode on separate nodes
             ),
             max_running_requests=8,
             max_total_tokens=32_768

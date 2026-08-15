@@ -10,7 +10,10 @@
 
 from accelerate import init_empty_weights
 from muna import compile, BatchConfig, Parameter, Sandbox
-from muna.beta import Annotations, SGLangInferenceMetadata, SpeculativeDecodingConfig
+from muna.beta import (
+    Annotations, KVRoutingMetadata, SGLangInferenceMetadata,
+    SpeculativeDecodingConfig
+)
 from muna.beta.openai import (
     ChatCompletion, ChatCompletionChunk, DeltaMessage,
     Message, StreamChoice
@@ -78,6 +81,16 @@ manager = model.init_continuous_batching(
     continuous_batching_config=batching_config,
 )
 
+# Define a tokenization function
+# This function is both used for both inference and KV-aware routing
+def _tokenize(messages) -> list[int]:
+    return tokenizer.apply_chat_template(
+        [{ "role": m.role, "content": m.content } for m in messages],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=False,
+    )
+
 @compile(
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
     sandbox=Sandbox()
@@ -98,7 +111,8 @@ manager = model.init_continuous_batching(
             ),
             max_running_requests=4,
             max_total_tokens=32_768
-        )
+        ),
+        KVRoutingMetadata(tokenize=_tokenize)
     ]
 )
 def glm_5_2(
@@ -121,19 +135,13 @@ def glm_5_2(
     """
     Stream chat completions from GLM 5.2 (NVFP4).
     """
-    # Tokenize message history
-    input_ids = tokenizer.apply_chat_template(
-        [{ "role": m.role, "content": m.content } for m in messages],
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=False,
-    )
-    completion_id = f"chatcmpl-{uuid4()}"
-    created = int(time())
-    prompt_tokens = len(input_ids)
     # Submit the request to the shared batching manager. Other concurrent calls
     # to this predictor add their own requests in parallel; the manager merges
     # them all into the next forward step.
+    input_ids = _tokenize(messages)
+    completion_id = f"chatcmpl-{uuid4()}"
+    created = int(time())
+    prompt_tokens = len(input_ids)
     manager.add_request(
         input_ids=input_ids,
         request_id=completion_id,
