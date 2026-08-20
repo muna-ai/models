@@ -5,78 +5,46 @@
 
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["accelerate", "muna", "tiktoken", "torch", "transformers>=5.12"]
+# dependencies = ["accelerate", "muna", "torch", "transformers>=5.12"]
 # ///
 
 from accelerate import init_empty_weights
-from contextlib import contextmanager
 from muna import compile, BatchConfig, Parameter, Sandbox
-from muna.beta import Annotations, KVRoutingMetadata, SGLangInferenceMetadata
+from muna.beta import Annotations, KVRoutingMetadata, TorchToSGLangInferenceMetadata
 from muna.beta.openai import (
-    ChatCompletion, ChatCompletionChunk, DeltaMessage,
-    Message, StreamChoice
+    ChatCompletion, ChatCompletionChunk, DeltaMessage, Message, StreamChoice
 )
+from os import environ
 from time import time
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
 from transformers.generation import ContinuousBatchingConfig, GenerationConfig
 from transformers.generation.continuous_batching import RequestStatus
-from transformers.modeling_utils import PreTrainedModel
 from typing import Annotated, Iterator
 from uuid import uuid4
 
-# Patch transformers since model was written for 4.x but we need >5.0 for continuous batching
-from transformers.utils import import_utils as _t_import_utils
-if not hasattr(_t_import_utils, "is_torch_fx_available"):
-    _t_import_utils.is_torch_fx_available = lambda: False
-
-# Helpers for loading the model in transformers v5
-@contextmanager
-def suppress_init_weights():
-    saved = PreTrainedModel.init_weights
-    PreTrainedModel.init_weights = lambda self, *a, **kw: None
-    try:
-        yield
-    finally:
-        PreTrainedModel.init_weights = saved
-
-@contextmanager
-def force_eager_attn(cfg):
-    def _walk(c):
-        if hasattr(c, "_attn_implementation"):
-            c._attn_implementation = "eager"
-        for sub in vars(c).values():
-            if hasattr(sub, "_attn_implementation"):
-                _walk(sub)
-    _walk(cfg)
-    yield cfg
-
-# Load the Kimi K2.6 model
-# We instantiate the model on the meta device to skip a ~500GB download
-CHECKPOINT = "nvidia/Kimi-K2.6-NVFP4"
-config = AutoConfig.from_pretrained(CHECKPOINT, trust_remote_code=True)
-tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT, trust_remote_code=True)
-with force_eager_attn(config), suppress_init_weights(), init_empty_weights():
-    model = AutoModelForCausalLM.from_config(
-        config,
-        trust_remote_code=True,
+# Load the Qwen 3.8 text backbone
+CHECKPOINT = "Qwen/Qwen3.8-27B"
+config = AutoConfig.from_pretrained(CHECKPOINT)
+tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
+text_config = config.text_config
+text_config._name_or_path = CHECKPOINT
+with init_empty_weights():
+    model = Qwen3_5ForCausalLM._from_config(
+        text_config,
         attn_implementation="eager",
     )
 
-# Resolve the reasoning marker tokens
+# Resolve the reasoning marker tokens.
 THINK_OPEN = tokenizer.convert_tokens_to_ids("<think>")
 THINK_CLOSE = tokenizer.convert_tokens_to_ids("</think>")
 
 # Create the continuous batching manager
 generation_config = GenerationConfig(
     max_new_tokens=2048,
-    eos_token_id=[
-        tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|im_end|>")
-    ],
+    eos_token_id=tokenizer.eos_token_id,
     pad_token_id=tokenizer.pad_token_id,
     do_sample=True,
     temperature=0.7,
-    top_p=0.95,
     top_k=50,
 )
 batching_config = ContinuousBatchingConfig(
@@ -89,9 +57,9 @@ manager = model.init_continuous_batching(
     continuous_batching_config=batching_config,
 )
 
-# Define a tokenization helper
-# This function is both used for both model inference and KV-aware routing
-def _tokenize(messages: list[Message]) -> list[int]:
+# Define a tokenization function
+# This function is both used for both inference and KV-aware routing
+def _tokenize(messages) -> list[int]:
     return tokenizer.apply_chat_template(
         [{ "role": m.role, "content": m.content } for m in messages],
         add_generation_prompt=True,
@@ -100,21 +68,26 @@ def _tokenize(messages: list[Message]) -> list[int]:
     )
 
 @compile(
-    targets=["x86_64-unknown-linux-gnu"], # Linux x64 + CUDA only
+    targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
     sandbox=Sandbox()
-        .pip_install("accelerate", "tiktoken", "torch", "transformers>=5.12"),
+        .pip_install("torch", index_url="https://download.pytorch.org/whl/cpu")
+        .pip_install("accelerate", "transformers>=5.12")
+        .env({
+            "HF_TOKEN": environ.get("HF_TOKEN", ""),
+            "HF_HUB_ENABLE_HF_TRANSFER": "1"
+        }),
     metadata=[
-        SGLangInferenceMetadata(
+        TorchToSGLangInferenceMetadata(
             model=model,
             compute_architecture="sm_100",  # Compile for Blackwell
-            tensor_parallelism=4,           # Run on 4xB200
+            tensor_parallelism=1,           # 27B BF16 fits one B200
             max_running_requests=4,
             max_total_tokens=32_768
         ),
         KVRoutingMetadata(tokenize=_tokenize)
     ]
 )
-def kimi_k2_6(
+def qwen_3_8_27b(
     messages: Annotated[list[Message], Parameter.Generic(
         description="Messages comprising the conversation so far.",
         batch=BatchConfig(mode="continuous")
@@ -123,37 +96,30 @@ def kimi_k2_6(
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
         min=1,
-        max=16384
-    )]=2048,
+        max=32768
+    )]=32768,
     temperature: Annotated[float, Annotations.SamplingTemperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0
     )]=0.7,
-    top_p: Annotated[float, Annotations.SamplingProbability(
-        description="Nucleus sampling probability.",
-        min=0.0,
-        max=1.0
-    )]=0.95,
 ) -> Iterator[ChatCompletionChunk]:
     """
-    Stream chat completions from Kimi K2.6 (NVFP4).
+    Stream chat completions from Qwen 3.8 27B (BF16).
     """
-    # Tokenize message history
+    # Submit the request to the shared batching manager. Other concurrent calls
+    # to this predictor add their own requests in parallel; the manager merges
+    # them all into the next forward step.
     input_ids = _tokenize(messages)
     completion_id = f"chatcmpl-{uuid4()}"
     created = int(time())
     prompt_tokens = len(input_ids)
-    # Submit the request to the shared batching manager. Other concurrent calls
-    # to this predictor add their own requests in parallel; the manager merges
-    # them all into the next forward step.
     manager.add_request(
         input_ids=input_ids,
         request_id=completion_id,
         streaming=True,
         max_new_tokens=max_output_tokens,
-        temperature=temperature,
-        top_p=top_p,
+        temperature=temperature
     )
     # First chunk announces the assistant role with no content, mirroring the
     # OpenAI streaming protocol.
@@ -185,32 +151,29 @@ def kimi_k2_6(
             if not finished:
                 continue
             # Yield end of stream
-            else:
-                yield ChatCompletionChunk(
-                    id=completion_id,
-                    created=created,
-                    model=CHECKPOINT,
-                    choices=[StreamChoice(
-                        index=0,
-                        delta=DeltaMessage(content=""),
-                        finish_reason=finish_reason,
-                    )],
-                    usage=ChatCompletion.Usage(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        total_tokens=prompt_tokens + completion_tokens,
-                        prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
-                            cached_tokens=cached_tokens,
-                        ),
-                        completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
-                            reasoning_tokens=reasoning_tokens,
-                        ),
+            yield ChatCompletionChunk(
+                id=completion_id,
+                created=created,
+                model=CHECKPOINT,
+                choices=[StreamChoice(
+                    index=0,
+                    delta=DeltaMessage(content=""),
+                    finish_reason=finish_reason,
+                )],
+                usage=ChatCompletion.Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
+                        cached_tokens=cached_tokens,
                     ),
-                )
-                break
-        # Split the new tokens on the `</think>` boundary. The marker token
-        # itself is excluded from both segments: with no boundary in this
-        # chunk, slicing at len() keeps everything reasoning-side.
+                    completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
+                        reasoning_tokens=reasoning_tokens,
+                    ),
+                ),
+            )
+            break
+        # Split the new tokens on the `</think>` boundary
         crossed = in_reasoning and THINK_CLOSE in new_token_ids
         boundary = new_token_ids.index(THINK_CLOSE) if crossed else len(new_token_ids)
         reasoning_ids = new_token_ids[:boundary] if in_reasoning else []
@@ -232,7 +195,7 @@ def kimi_k2_6(
                 reasoning_tokens=reasoning_tokens,
             ),
         ) if finished else None
-        # Yield the reasoning delta as it is mutually exclusive
+        # Yield the reasoning delta as it is mutually exclusive with content
         if reasoning_text:
             yield ChatCompletionChunk(
                 id=completion_id,
@@ -244,7 +207,8 @@ def kimi_k2_6(
                     finish_reason=None,
                 )],
             )
-        # Yield the content delta
+        # Yield the content delta. The final chunk always carries the finish
+        # reason and usage, even when its content is empty.
         if content_text or finished:
             yield ChatCompletionChunk(
                 id=completion_id,

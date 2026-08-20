@@ -5,16 +5,16 @@
 
 # /// script
 # requires-python = ">=3.12"
-# dependencies = [
-#   "accelerate", "flash-attn", "jinja2", "muna", "nvidia-modelopt",
-#   "tiktoken", "torch", "transformers>=5.7"
-# ]
+# dependencies = ["accelerate", "muna", "tiktoken", "torch", "transformers>=5.12"]
 # ///
 
 from accelerate import init_empty_weights
 from contextlib import contextmanager
 from muna import compile, BatchConfig, Parameter, Sandbox
-from muna.beta import Annotations, SGLangInferenceMetadata, SpeculativeDecodingConfig
+from muna.beta import (
+    Annotations, KVRoutingMetadata, SGLangInferenceMetadata,
+    SpeculativeDecodingConfig
+)
 from muna.beta.openai import (
     ChatCompletion, ChatCompletionChunk, DeltaMessage,
     Message, StreamChoice
@@ -76,6 +76,10 @@ with force_eager_attn(draft_config), suppress_init_weights(), init_empty_weights
         attn_implementation="eager",
     )
 
+# Resolve the reasoning marker tokens
+THINK_OPEN = tokenizer.convert_tokens_to_ids("<think>")
+THINK_CLOSE = tokenizer.convert_tokens_to_ids("</think>")
+
 # Create the continuous batching manager
 generation_config = GenerationConfig(
     max_new_tokens=2048,
@@ -99,12 +103,20 @@ manager = model.init_continuous_batching(
     continuous_batching_config=batching_config,
 )
 
+# Define a tokenization helper
+# This function is both used for both model inference and KV-aware routing
+def _tokenize(messages: list[Message]) -> list[int]:
+    return tokenizer.apply_chat_template(
+        [{ "role": m.role, "content": m.content } for m in messages],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=False,
+    )
+
 @compile(
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
-    sandbox=Sandbox().pip_install(
-        "accelerate", "nvidia-modelopt", "tiktoken",
-        "torch", "transformers>=5.7"
-    ),
+    sandbox=Sandbox()
+        .pip_install("accelerate", "tiktoken", "torch", "transformers>=5.12"),
     metadata=[
         SGLangInferenceMetadata(
             model=model,
@@ -116,7 +128,8 @@ manager = model.init_continuous_batching(
             ),
             max_running_requests=4,
             max_total_tokens=32_768
-        )
+        ),
+        KVRoutingMetadata(tokenize=_tokenize)
     ]
 )
 def kimi_k2_5(
@@ -177,13 +190,18 @@ def kimi_k2_5(
             finish_reason=None,
         )],
     )
-    # Stream tokens from the manager
+    # Stream tokens from the manager, splitting reasoning from content
+    in_reasoning = input_ids[-1] == THINK_OPEN
     completion_tokens = 0
+    reasoning_tokens = 0
+    cached_tokens = 0
     seen = 0
     for chunk in manager.request_id_iter(request_id=completion_id):
         new_token_ids = chunk.generated_tokens[seen:]
         seen = len(chunk.generated_tokens)
         finished = chunk.status == RequestStatus.FINISHED
+        finish_reason = "length" if seen >= max_output_tokens else "stop"
+        cached_tokens = getattr(chunk, "cached_tokens", 0)
         # Check for empty chunk
         if not new_token_ids:
             # Usually signifies a status change
@@ -198,37 +216,70 @@ def kimi_k2_5(
                     choices=[StreamChoice(
                         index=0,
                         delta=DeltaMessage(content=""),
-                        finish_reason="stop",
+                        finish_reason=finish_reason,
                     )],
                     usage=ChatCompletion.Usage(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=prompt_tokens + completion_tokens,
+                        prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
+                            cached_tokens=cached_tokens,
+                        ),
+                        completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
+                            reasoning_tokens=reasoning_tokens,
+                        ),
                     ),
                 )
                 break
-        # Decode
-        token_text = tokenizer.decode(new_token_ids, skip_special_tokens=True)
+        # Split the new tokens on the `</think>` boundary. The marker token
+        # itself is excluded from both segments: with no boundary in this
+        # chunk, slicing at len() keeps everything reasoning-side.
+        crossed = in_reasoning and THINK_CLOSE in new_token_ids
+        boundary = new_token_ids.index(THINK_CLOSE) if crossed else len(new_token_ids)
+        reasoning_ids = new_token_ids[:boundary] if in_reasoning else []
+        content_ids = new_token_ids[boundary + 1:] if in_reasoning else new_token_ids
+        in_reasoning = in_reasoning and not crossed
+        reasoning_text = tokenizer.decode(reasoning_ids, skip_special_tokens=True)
+        content_text = tokenizer.decode(content_ids, skip_special_tokens=True)
         completion_tokens += len(new_token_ids)
-        finish_reason = "stop" if finished else None
+        reasoning_tokens += len(reasoning_ids)
         # Create usage
         usage = ChatCompletion.Usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
+                cached_tokens=cached_tokens,
+            ),
+            completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
+                reasoning_tokens=reasoning_tokens,
+            ),
         ) if finished else None
-        # Yield chunk
-        yield ChatCompletionChunk(
-            id=completion_id,
-            created=created,
-            model=CHECKPOINT,
-            choices=[StreamChoice(
-                index=0,
-                delta=DeltaMessage(content=token_text),
-                finish_reason=finish_reason,
-            )],
-            usage=usage,
-        )
+        # Yield the reasoning delta
+        if reasoning_text:
+            yield ChatCompletionChunk(
+                id=completion_id,
+                created=created,
+                model=CHECKPOINT,
+                choices=[StreamChoice(
+                    index=0,
+                    delta=DeltaMessage(reasoning_content=reasoning_text),
+                    finish_reason=None,
+                )],
+            )
+        # Yield the content delta
+        if content_text or finished:
+            yield ChatCompletionChunk(
+                id=completion_id,
+                created=created,
+                model=CHECKPOINT,
+                choices=[StreamChoice(
+                    index=0,
+                    delta=DeltaMessage(content=content_text),
+                    finish_reason=finish_reason if finished else None,
+                )],
+                usage=usage,
+            )
         # Handle finish with content
         if finished:
             break
