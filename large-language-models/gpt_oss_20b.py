@@ -45,12 +45,12 @@ def gpt_oss_20b(
         int,
         Annotations.MaxOutputTokens(description="Maximum number of tokens in the response.")
     ]=5_000,
-    temperature: Annotated[float, Annotations.SamplingTemperature(
+    temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature (randomness).",
         min=0.0,
         max=2.0
     )]=1.0,
-    top_p: Annotated[float, Annotations.SamplingProbability(
+    top_p: Annotated[float, Annotations.TopP(
         description="Sampling probability for token selection.",
         min=0.0,
         max=1.0

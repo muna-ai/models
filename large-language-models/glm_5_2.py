@@ -130,7 +130,7 @@ def glm_5_2(
         min=1,
         max=32768
     )]=32768,
-    temperature: Annotated[float, Annotations.SamplingTemperature(
+    temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0

@@ -10,12 +10,16 @@
 
 from accelerate import init_empty_weights
 from muna import compile, BatchConfig, Parameter, Sandbox
-from muna.beta import Annotations, KVRoutingMetadata, TorchToSGLangInferenceMetadata
+from muna.beta import (
+    Annotations, KVRoutingMetadata, SpeculativeDecodingConfig,
+    TorchToSGLangInferenceMetadata
+)
 from muna.beta.openai import (
     ChatCompletion, ChatCompletionChunk, DeltaMessage, Message, StreamChoice
 )
 from os import environ
 from time import time
+from torch.nn import Module
 from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
 from transformers.generation import ContinuousBatchingConfig, GenerationConfig
 from transformers.generation.continuous_batching import RequestStatus
@@ -34,7 +38,21 @@ with init_empty_weights():
         attn_implementation="eager",
     )
 
-# Resolve the reasoning marker tokens.
+# Load the DFlash2 draft model config.
+# Transformers has no `DFlash2DraftModel` class and the checkpoint ships no
+# remote code, so the drafter cannot be instantiated here. The compiler only
+# needs a module carrying the config.
+DRAFT_CHECKPOINT = "z-lab/Qwen3.8-27B-DFlash2"
+draft_config = AutoConfig.from_pretrained(DRAFT_CHECKPOINT)
+
+class DFlash2DraftStub(Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+draft_model = DFlash2DraftStub(draft_config)
+
+# Resolve the reasoning marker tokens
 THINK_OPEN = tokenizer.convert_tokens_to_ids("<think>")
 THINK_CLOSE = tokenizer.convert_tokens_to_ids("</think>")
 
@@ -81,6 +99,10 @@ def _tokenize(messages) -> list[int]:
             model=model,
             compute_architecture="sm_100",  # Compile for Blackwell
             tensor_parallelism=1,           # 27B BF16 fits one B200
+            speculative_decoding=SpeculativeDecodingConfig(
+                draft_model=draft_model,
+                num_draft_tokens=8,         # DFlash2 block size
+            ),
             max_running_requests=4,
             max_total_tokens=32_768
         ),
@@ -98,7 +120,7 @@ def qwen_3_8_27b(
         min=1,
         max=32768
     )]=32768,
-    temperature: Annotated[float, Annotations.SamplingTemperature(
+    temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0
@@ -134,7 +156,7 @@ def qwen_3_8_27b(
         )],
     )
     # Stream tokens from the manager, splitting reasoning from content.
-    in_reasoning = input_ids[-1] == THINK_OPEN
+    in_reasoning = _starts_in_reasoning(input_ids)
     completion_tokens = 0
     reasoning_tokens = 0
     cached_tokens = 0
@@ -224,3 +246,17 @@ def qwen_3_8_27b(
         # Handle finish with content
         if finished:
             break
+
+def _starts_in_reasoning(input_ids: list[int]) -> bool:
+    """
+    The Qwen3.8 template ends the generation prompt with `<think>\n` when
+    thinking is enabled (trailing newline, so the *last* token is not the
+    marker) and with a closed `<think>\n\n</think>\n\n` block when disabled.
+    Scan back to the most recent marker instead of checking the final token.
+    """
+    for token in reversed(input_ids):
+        if token == THINK_OPEN:
+            return True
+        if token == THINK_CLOSE:
+            return False
+    return False

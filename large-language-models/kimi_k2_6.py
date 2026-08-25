@@ -125,12 +125,12 @@ def kimi_k2_6(
         min=1,
         max=16384
     )]=2048,
-    temperature: Annotated[float, Annotations.SamplingTemperature(
+    temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0
     )]=0.7,
-    top_p: Annotated[float, Annotations.SamplingProbability(
+    top_p: Annotated[float, Annotations.TopP(
         description="Nucleus sampling probability.",
         min=0.0,
         max=1.0
