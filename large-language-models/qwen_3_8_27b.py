@@ -27,7 +27,7 @@ from typing import Annotated, Iterator
 from uuid import uuid4
 
 # Load the Qwen 3.8 text backbone
-CHECKPOINT = "Qwen/Qwen3.8-27B"
+CHECKPOINT = "RadixArk/Qwen3.8-27B-NVFP4"
 config = AutoConfig.from_pretrained(CHECKPOINT)
 tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
 text_config = config.text_config
@@ -98,7 +98,7 @@ def _tokenize(messages) -> list[int]:
         TorchToSGLangInferenceMetadata(
             model=model,
             compute_architecture="sm_100",  # Compile for Blackwell
-            tensor_parallelism=1,           # 27B BF16 fits one B200
+            tensor_parallelism=1,
             speculative_decoding=SpeculativeDecodingConfig(
                 draft_model=draft_model,
                 num_draft_tokens=8,         # DFlash2 block size
@@ -127,7 +127,7 @@ def qwen_3_8_27b(
     )]=0.7,
 ) -> Iterator[ChatCompletionChunk]:
     """
-    Stream chat completions from Qwen 3.8 27B (BF16).
+    Stream chat completions from Qwen 3.8 27B (NVFP4).
     """
     # Submit the request to the shared batching manager. Other concurrent calls
     # to this predictor add their own requests in parallel; the manager merges
