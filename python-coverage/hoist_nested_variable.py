@@ -10,9 +10,10 @@
 # accessible outside that scope.
 #
 # But in C++, variables defined within a scope cannot be accessed outside that scope.
-# So to emulate Python's behaviour in C++, we simply hoist all variables that are 
-# accessed outside their defining scope. We then promote the type of the hoisted 
-# variable accordingly (e.g. `T` becomes `std::optional<T>`).
+# So to emulate Python's behaviour in C++, we hoist all variables whose declaring block
+# does not enclose every use, declaring them at function scope with their resolved type
+# and value-initialized (e.g. `int64_t result{};`). Note that if the loop below never ran,
+# Python would raise `UnboundLocalError` while the compiled function returns `0`.
 
 from muna import compile
 import numpy as np
