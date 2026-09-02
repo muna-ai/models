@@ -8,16 +8,21 @@
 # dependencies = ["accelerate", "muna", "torch", "transformers>=5.12"]
 # ///
 
+from __future__ import annotations
 from accelerate import init_empty_weights
+from enum import IntEnum
+from json import dumps, loads
 from muna import compile, BatchConfig, Parameter, Sandbox
 from muna.beta import (
     Annotations, KVRoutingMetadata, SpeculativeDecodingConfig,
     TorchToSGLangInferenceMetadata
 )
 from muna.beta.openai import (
-    ChatCompletion, ChatCompletionChunk, DeltaMessage, Message, StreamChoice
+    ChatCompletion, ChatCompletionChunk, ChoiceDeltaToolCall,
+    DeltaMessage, Message, StreamChoice
 )
 from os import environ
+from pydantic import BaseModel
 from time import time
 from torch.nn import Module
 from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
@@ -52,9 +57,11 @@ class DFlash2DraftStub(Module):
 
 draft_model = DFlash2DraftStub(draft_config)
 
-# Resolve the reasoning marker tokens
+# Resolve the reasoning and tool call marker tokens
 THINK_OPEN = tokenizer.convert_tokens_to_ids("<think>")
 THINK_CLOSE = tokenizer.convert_tokens_to_ids("</think>")
+TOOL_OPEN = tokenizer.convert_tokens_to_ids("<tool_call>")
+TOOL_CLOSE = tokenizer.convert_tokens_to_ids("</tool_call>")
 
 # Create the continuous batching manager
 generation_config = GenerationConfig(
@@ -77,9 +84,18 @@ manager = model.init_continuous_batching(
 
 # Define a tokenization function
 # This function is both used for both inference and KV-aware routing
-def _tokenize(messages) -> list[int]:
+def _tokenize(
+    messages: list[Message],
+    tools: list[dict] | None = None
+) -> list[int]:
     return tokenizer.apply_chat_template(
-        [{ "role": m.role, "content": m.content } for m in messages],
+        [{
+            "role": m.role,
+            "content": m.content,
+            "tool_calls": m.tool_calls,
+            "tool_call_id": m.tool_call_id
+        } for m in messages],
+        tools=tools,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=False,
@@ -91,7 +107,7 @@ def _tokenize(messages) -> list[int]:
         .pip_install("torch", index_url="https://download.pytorch.org/whl/cpu")
         .pip_install("accelerate", "transformers>=5.12")
         .env({
-            "HF_TOKEN": environ.get("HF_TOKEN", ""),
+            "HF_TOKEN": environ.get("HF_TOKEN"),
             "HF_HUB_ENABLE_HF_TRANSFER": "1"
         }),
     metadata=[
@@ -115,6 +131,10 @@ def qwen_3_8_27b(
         batch=BatchConfig(mode="continuous")
     )],
     *,
+    tools: Annotated[
+        list[dict],
+        Annotations.ChatTools(description="Tools the model may call."
+    )]=None,
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
         min=1,
@@ -132,7 +152,7 @@ def qwen_3_8_27b(
     # Submit the request to the shared batching manager. Other concurrent calls
     # to this predictor add their own requests in parallel; the manager merges
     # them all into the next forward step.
-    input_ids = _tokenize(messages)
+    input_ids = _tokenize(messages, tools)
     completion_id = f"chatcmpl-{uuid4()}"
     created = int(time())
     prompt_tokens = len(input_ids)
@@ -143,109 +163,156 @@ def qwen_3_8_27b(
         max_new_tokens=max_output_tokens,
         temperature=temperature
     )
-    # First chunk announces the assistant role with no content, mirroring the
-    # OpenAI streaming protocol.
-    yield ChatCompletionChunk(
+    # First chunk announces the assistant role with no content (match OpenAI protocol)
+    yield _chunk(completion_id, created, DeltaMessage(role="assistant", content=""))
+    # Compose the token pipeline: raw tokens, reasoning, and tools
+    events = _create_token_stream(completion_id)
+    events = _split_token_stream(
+        events,
+        open_id=THINK_OPEN,
+        close_id=THINK_CLOSE,
+        out_kind=_EventKind.REASONING,
+        buffered=False,
+        initial=_starts_in_reasoning(input_ids)
+    )
+    events = _split_token_stream(
+        events,
+        open_id=TOOL_OPEN,
+        close_id=TOOL_CLOSE,
+        out_kind=_EventKind.TOOL_CALL,
+        buffered=True,
+        initial=False
+    )
+    # Render events as OpenAI chunks
+    reasoning_tokens = 0
+    tool_calls = 0
+    for event in events:
+        match event.kind:
+            case _EventKind.REASONING:
+                reasoning_tokens += len(event.token_ids)
+                text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                if text:
+                    yield _chunk(completion_id, created, DeltaMessage(reasoning_content=text))
+            case _EventKind.TOKENS:
+                text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                if text:
+                    yield _chunk(completion_id, created, DeltaMessage(content=text))
+            case _EventKind.TOOL_CALL:
+                text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                payload = loads(text)
+                tool_call = ChoiceDeltaToolCall(
+                    index=tool_calls,
+                    id=f"call_{uuid4()}",
+                    type="function",
+                    function=ChoiceDeltaToolCall.Function(
+                        name=payload["name"],
+                        arguments=dumps(payload["arguments"])
+                    )
+                )
+                tool_calls += 1
+                yield _chunk(completion_id, created, DeltaMessage(tool_calls=[tool_call]))
+            case _EventKind.FINISHED:
+                finish_reason = _finish_reason(
+                    completion_tokens=event.completion_tokens,
+                    max_output_tokens=max_output_tokens,
+                    tool_calls=tool_calls
+                )
+                usage = ChatCompletion.Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=event.completion_tokens,
+                    total_tokens=prompt_tokens + event.completion_tokens,
+                    prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
+                        cached_tokens=event.cached_tokens,
+                    ),
+                    completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
+                        reasoning_tokens=reasoning_tokens,
+                    ),
+                )
+                yield _chunk(completion_id, created, DeltaMessage(content=""), finish_reason, usage)
+
+def _create_token_stream(request_id: str) -> Iterator[_Event]:
+    """
+    Transform the batching manager's chunk stream into a token stream.
+    """
+    seen = 0
+    for chunk in manager.request_id_iter(request_id=request_id):
+        new_token_ids = chunk.generated_tokens[seen:]
+        seen = len(chunk.generated_tokens)
+        if new_token_ids:
+            yield _Event(kind=_EventKind.TOKENS, token_ids=new_token_ids)
+        if chunk.status == RequestStatus.FINISHED:
+            yield _Event(
+                kind=_EventKind.FINISHED,
+                completion_tokens=seen,
+                cached_tokens=getattr(chunk, "cached_tokens", 0)
+            )
+            return
+
+def _split_token_stream(
+    upstream: Iterator[_Event],
+    open_id: int,
+    close_id: int,
+    out_kind: int,
+    buffered: bool,
+    initial: bool
+) -> Iterator[_Event]:
+    """
+    Map token spans between `open_id` and `close_id` and relabel them as `out_kind`.
+    All other tokens are passthrough, while marker tokens are consumed.
+    When `buffered`, held tokens are emitted as one event at the close marker instead of streamed.
+    """
+    inside = initial
+    buffer = [0][:0]
+    for event in upstream:
+        if event.kind == _EventKind.FINISHED and inside and buffered and buffer:
+            yield _Event(kind=out_kind, token_ids=buffer)
+            yield event
+            continue
+        if event.kind != _EventKind.TOKENS:
+            yield event
+            continue
+        ids = event.token_ids
+        while ids:
+            marker = close_id if inside else open_id
+            crossed = marker in ids
+            boundary = ids.index(marker) if crossed else len(ids)
+            span = ids[:boundary]
+            ids = ids[boundary + 1:]
+            if not inside:
+                if span:
+                    yield _Event(kind=_EventKind.TOKENS, token_ids=span)
+            elif buffered:
+                buffer = buffer + span
+                if crossed:
+                    yield _Event(kind=out_kind, token_ids=buffer)
+                    buffer.clear()
+            else:
+                if span:
+                    yield _Event(kind=out_kind, token_ids=span)
+            if crossed:
+                inside = not inside
+
+def _chunk(
+    completion_id: str,
+    created: int,
+    delta: DeltaMessage,
+    finish_reason: str | None = None,
+    usage: ChatCompletion.Usage | None = None
+) -> ChatCompletionChunk:
+    """
+    Construct a single-choice streaming chunk.
+    """
+    return ChatCompletionChunk(
         id=completion_id,
         created=created,
         model=CHECKPOINT,
         choices=[StreamChoice(
             index=0,
-            delta=DeltaMessage(role="assistant", content=""),
-            finish_reason=None,
+            delta=delta,
+            finish_reason=finish_reason,
         )],
+        usage=usage,
     )
-    # Stream tokens from the manager, splitting reasoning from content.
-    in_reasoning = _starts_in_reasoning(input_ids)
-    completion_tokens = 0
-    reasoning_tokens = 0
-    cached_tokens = 0
-    seen = 0
-    for chunk in manager.request_id_iter(request_id=completion_id):
-        new_token_ids = chunk.generated_tokens[seen:]
-        seen = len(chunk.generated_tokens)
-        finished = chunk.status == RequestStatus.FINISHED
-        finish_reason = "length" if seen >= max_output_tokens else "stop"
-        cached_tokens = getattr(chunk, "cached_tokens", 0)
-        # Check for empty chunk
-        if not new_token_ids:
-            # Usually signifies a status change
-            if not finished:
-                continue
-            # Yield end of stream
-            yield ChatCompletionChunk(
-                id=completion_id,
-                created=created,
-                model=CHECKPOINT,
-                choices=[StreamChoice(
-                    index=0,
-                    delta=DeltaMessage(content=""),
-                    finish_reason=finish_reason,
-                )],
-                usage=ChatCompletion.Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                    prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
-                        cached_tokens=cached_tokens,
-                    ),
-                    completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
-                        reasoning_tokens=reasoning_tokens,
-                    ),
-                ),
-            )
-            break
-        # Split the new tokens on the `</think>` boundary
-        crossed = in_reasoning and THINK_CLOSE in new_token_ids
-        boundary = new_token_ids.index(THINK_CLOSE) if crossed else len(new_token_ids)
-        reasoning_ids = new_token_ids[:boundary] if in_reasoning else []
-        content_ids = new_token_ids[boundary + 1:] if in_reasoning else new_token_ids
-        in_reasoning = in_reasoning and not crossed
-        reasoning_text = tokenizer.decode(reasoning_ids, skip_special_tokens=True)
-        content_text = tokenizer.decode(content_ids, skip_special_tokens=True)
-        completion_tokens += len(new_token_ids)
-        reasoning_tokens += len(reasoning_ids)
-        # Create usage
-        usage = ChatCompletion.Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
-                cached_tokens=cached_tokens,
-            ),
-            completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
-                reasoning_tokens=reasoning_tokens,
-            ),
-        ) if finished else None
-        # Yield the reasoning delta as it is mutually exclusive with content
-        if reasoning_text:
-            yield ChatCompletionChunk(
-                id=completion_id,
-                created=created,
-                model=CHECKPOINT,
-                choices=[StreamChoice(
-                    index=0,
-                    delta=DeltaMessage(reasoning_content=reasoning_text),
-                    finish_reason=None,
-                )],
-            )
-        # Yield the content delta. The final chunk always carries the finish
-        # reason and usage, even when its content is empty.
-        if content_text or finished:
-            yield ChatCompletionChunk(
-                id=completion_id,
-                created=created,
-                model=CHECKPOINT,
-                choices=[StreamChoice(
-                    index=0,
-                    delta=DeltaMessage(content=content_text),
-                    finish_reason=finish_reason if finished else None,
-                )],
-                usage=usage,
-            )
-        # Handle finish with content
-        if finished:
-            break
 
 def _starts_in_reasoning(input_ids: list[int]) -> bool:
     """
@@ -260,3 +327,33 @@ def _starts_in_reasoning(input_ids: list[int]) -> bool:
         if token == THINK_CLOSE:
             return False
     return False
+
+def _finish_reason(
+    completion_tokens: int,
+    max_output_tokens: int,
+    tool_calls: int
+) -> str:
+    """
+    Compute the finish reason for a completed generation.
+    """
+    if completion_tokens >= max_output_tokens: return "length"
+    if tool_calls > 0: return "tool_calls"
+    return "stop"
+
+class _EventKind(IntEnum):
+    """
+    Kind of an event flowing through the token pipeline.
+    """
+    TOKENS = 0      # unclaimed tokens, destined for `content`
+    REASONING = 1   # tokens inside `<think>`...`</think>`
+    TOOL_CALL = 2   # inner tokens of one complete `<tool_call>` block
+    FINISHED = 3    # terminal event, carries stream totals
+
+class _Event(BaseModel):
+    """
+    One event in the token pipeline.
+    """
+    kind: int
+    token_ids: list[int] = []
+    completion_tokens: int = 0  # FINISHED only: total generated, markers included
+    cached_tokens: int = 0      # FINISHED only: prefix-cache hits
