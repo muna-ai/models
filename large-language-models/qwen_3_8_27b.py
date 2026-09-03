@@ -11,7 +11,7 @@
 from __future__ import annotations
 from accelerate import init_empty_weights
 from enum import IntEnum
-from json import dumps, loads
+from json import dumps
 from muna import compile, BatchConfig, Parameter, Sandbox
 from muna.beta import (
     Annotations, KVRoutingMetadata, SpeculativeDecodingConfig,
@@ -62,6 +62,28 @@ THINK_OPEN = tokenizer.convert_tokens_to_ids("<think>")
 THINK_CLOSE = tokenizer.convert_tokens_to_ids("</think>")
 TOOL_OPEN = tokenizer.convert_tokens_to_ids("<tool_call>")
 TOOL_CLOSE = tokenizer.convert_tokens_to_ids("</tool_call>")
+
+# Response template for one tool call body. Qwen 3.8 emits tool calls as
+# `<function=NAME><parameter=KEY>VALUE</parameter>...</function>` inside
+# `<tool_call>` markers.
+TOOL_CALL_TEMPLATE = {
+    "start_anchor": "<|im_start|>assistant\n",
+    "fields": {
+        "tool_calls": {
+            "open_pattern": r"<function=(?P<name>[\w.\-]+)>",
+            "close": "</function>",
+            "repeats": True,
+            "content": "xml-inline",
+            "content_args": {
+                "tag_pattern": r"<parameter=(?P<key>[\w.\-]+)>\n?(?P<value>.*?)\n?</parameter>"
+            },
+            "transform": {
+                "type": "function",
+                "function": { "name": "{name}", "arguments": "{content}" }
+            }
+        }
+    }
+}
 
 # Create the continuous batching manager
 generation_config = GenerationConfig(
@@ -199,14 +221,20 @@ def qwen_3_8_27b(
                     yield _chunk(completion_id, created, DeltaMessage(content=text))
             case _EventKind.TOOL_CALL:
                 text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
-                payload = loads(text)
+                message = tokenizer.parse_response(
+                    text,
+                    TOOL_CALL_TEMPLATE,
+                    prefix="",
+                    tools=tools
+                )
+                function = message["tool_calls"][0]["function"]
                 tool_call = ChoiceDeltaToolCall(
                     index=tool_calls,
                     id=f"call_{uuid4()}",
                     type="function",
                     function=ChoiceDeltaToolCall.Function(
-                        name=payload["name"],
-                        arguments=dumps(payload["arguments"])
+                        name=function["name"],
+                        arguments=dumps(function["arguments"])
                     )
                 )
                 tool_calls += 1
