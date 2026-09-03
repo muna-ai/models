@@ -107,7 +107,7 @@ manager = model.init_continuous_batching(
 # This function is both used for both model inference and KV-aware routing
 def _tokenize(messages: list[Message]) -> list[int]:
     return tokenizer.apply_chat_template(
-        [{ "role": m.role, "content": m.content } for m in messages],
+        messages,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=False,
@@ -159,7 +159,7 @@ def kimi_k2_5(
     """
     # Tokenize message history
     input_ids = tokenizer.apply_chat_template(
-        [{ "role": m.role, "content": m.content } for m in messages],
+        messages,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=False,
