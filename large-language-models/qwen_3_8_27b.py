@@ -111,12 +111,7 @@ def _tokenize(
     tools: list[dict] | None = None
 ) -> list[int]:
     return tokenizer.apply_chat_template(
-        [{
-            "role": m.role,
-            "content": m.content,
-            "tool_calls": m.tool_calls,
-            "tool_call_id": m.tool_call_id
-        } for m in messages],
+        messages,
         tools=tools,
         add_generation_prompt=True,
         tokenize=True,
@@ -142,7 +137,7 @@ def _tokenize(
                 num_draft_tokens=8,         # DFlash2 block size
             ),
             max_running_requests=4,
-            max_total_tokens=32_768
+            max_total_tokens=131_072
         ),
         KVRoutingMetadata(tokenize=_tokenize)
     ]
@@ -155,8 +150,8 @@ def qwen_3_8_27b(
     *,
     tools: Annotated[
         list[dict],
-        Annotations.ChatTools(description="Tools the model may call."
-    )]=None,
+        Annotations.ChatTools(description="Tools the model may call.")
+    ]=None,
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
         min=1,
@@ -208,18 +203,29 @@ def qwen_3_8_27b(
     # Render events as OpenAI chunks
     reasoning_tokens = 0
     tool_calls = 0
+    held_newlines = ""
+    trim_content = False
     for event in events:
         match event.kind:
             case _EventKind.REASONING:
                 reasoning_tokens += len(event.token_ids)
-                text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
-                if text:
-                    yield _chunk(completion_id, created, DeltaMessage(reasoning_content=text))
+                text = held_newlines + tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                kept = text.rstrip("\n")
+                held_newlines = text[len(kept):]
+                trim_content = True
+                if kept:
+                    yield _chunk(completion_id, created, DeltaMessage(reasoning_content=kept))
             case _EventKind.TOKENS:
+                held_newlines = ""
                 text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                if trim_content:
+                    text = text.lstrip("\n")
+                    if text:
+                        trim_content = False
                 if text:
                     yield _chunk(completion_id, created, DeltaMessage(content=text))
             case _EventKind.TOOL_CALL:
+                held_newlines = ""
                 text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
                 message = tokenizer.parse_response(
                     text,
@@ -240,6 +246,7 @@ def qwen_3_8_27b(
                 tool_calls += 1
                 yield _chunk(completion_id, created, DeltaMessage(tool_calls=[tool_call]))
             case _EventKind.FINISHED:
+                held_newlines = ""
                 finish_reason = _finish_reason(
                     completion_tokens=event.completion_tokens,
                     max_output_tokens=max_output_tokens,
@@ -264,6 +271,8 @@ def _create_token_stream(request_id: str) -> Iterator[_Event]:
     """
     seen = 0
     for chunk in manager.request_id_iter(request_id=request_id):
+        if chunk.status == RequestStatus.FAILED:
+            raise RuntimeError(chunk.error)
         new_token_ids = chunk.generated_tokens[seen:]
         seen = len(chunk.generated_tokens)
         if new_token_ids:
