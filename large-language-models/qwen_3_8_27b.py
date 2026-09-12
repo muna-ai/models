@@ -180,90 +180,96 @@ def qwen_3_8_27b(
         max_new_tokens=max_output_tokens,
         temperature=temperature
     )
-    # First chunk announces the assistant role with no content (match OpenAI protocol)
-    yield _chunk(completion_id, created, DeltaMessage(role="assistant", content=""))
-    # Compose the token pipeline: raw tokens, reasoning, and tools
-    events = _create_token_stream(completion_id)
-    events = _split_token_stream(
-        events,
-        open_id=THINK_OPEN,
-        close_id=THINK_CLOSE,
-        out_kind=_EventKind.REASONING,
-        buffered=False,
-        initial=_starts_in_reasoning(input_ids)
-    )
-    events = _split_token_stream(
-        events,
-        open_id=TOOL_OPEN,
-        close_id=TOOL_CLOSE,
-        out_kind=_EventKind.TOOL_CALL,
-        buffered=True,
-        initial=False
-    )
-    # Render events as OpenAI chunks
-    reasoning_tokens = 0
-    tool_calls = 0
-    held_newlines = ""
-    trim_content = False
-    for event in events:
-        match event.kind:
-            case _EventKind.REASONING:
-                reasoning_tokens += len(event.token_ids)
-                text = held_newlines + tokenizer.decode(event.token_ids, skip_special_tokens=True)
-                kept = text.rstrip("\n")
-                held_newlines = text[len(kept):]
-                trim_content = True
-                if kept:
-                    yield _chunk(completion_id, created, DeltaMessage(reasoning_content=kept))
-            case _EventKind.TOKENS:
-                held_newlines = ""
-                text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
-                if trim_content:
-                    text = text.lstrip("\n")
+    # Stream the completion
+    try:
+        # First chunk announces the assistant role with no content (match OpenAI protocol)
+        yield _chunk(completion_id, created, DeltaMessage(role="assistant", content=""))
+        # Compose the token pipeline: raw tokens, reasoning, and tools
+        events = _create_token_stream(completion_id)
+        events = _split_token_stream(
+            events,
+            open_id=THINK_OPEN,
+            close_id=THINK_CLOSE,
+            out_kind=_EventKind.REASONING,
+            buffered=False,
+            initial=_starts_in_reasoning(input_ids)
+        )
+        events = _split_token_stream(
+            events,
+            open_id=TOOL_OPEN,
+            close_id=TOOL_CLOSE,
+            out_kind=_EventKind.TOOL_CALL,
+            buffered=True,
+            initial=False
+        )
+        # Render events as OpenAI chunks
+        reasoning_tokens = 0
+        tool_calls = 0
+        held_newlines = ""
+        trim_content = False
+        for event in events:
+            match event.kind:
+                case _EventKind.REASONING:
+                    reasoning_tokens += len(event.token_ids)
+                    text = held_newlines + tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                    kept = text.rstrip("\n")
+                    held_newlines = text[len(kept):]
+                    trim_content = True
+                    if kept:
+                        yield _chunk(completion_id, created, DeltaMessage(reasoning_content=kept))
+                case _EventKind.TOKENS:
+                    held_newlines = ""
+                    text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                    if trim_content:
+                        text = text.lstrip("\n")
+                        if text:
+                            trim_content = False
                     if text:
-                        trim_content = False
-                if text:
-                    yield _chunk(completion_id, created, DeltaMessage(content=text))
-            case _EventKind.TOOL_CALL:
-                held_newlines = ""
-                text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
-                message = tokenizer.parse_response(
-                    text,
-                    TOOL_CALL_TEMPLATE,
-                    prefix="",
-                    tools=tools
-                )
-                function = message["tool_calls"][0]["function"]
-                tool_call = ChoiceDeltaToolCall(
-                    index=tool_calls,
-                    id=f"call_{uuid4()}",
-                    type="function",
-                    function=ChoiceDeltaToolCall.Function(
-                        name=function["name"],
-                        arguments=dumps(function["arguments"])
+                        yield _chunk(completion_id, created, DeltaMessage(content=text))
+                case _EventKind.TOOL_CALL:
+                    held_newlines = ""
+                    text = tokenizer.decode(event.token_ids, skip_special_tokens=True)
+                    message = tokenizer.parse_response(
+                        text,
+                        TOOL_CALL_TEMPLATE,
+                        prefix="",
+                        tools=tools
                     )
-                )
-                tool_calls += 1
-                yield _chunk(completion_id, created, DeltaMessage(tool_calls=[tool_call]))
-            case _EventKind.FINISHED:
-                held_newlines = ""
-                finish_reason = _finish_reason(
-                    completion_tokens=event.completion_tokens,
-                    max_output_tokens=max_output_tokens,
-                    tool_calls=tool_calls
-                )
-                usage = ChatCompletion.Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=event.completion_tokens,
-                    total_tokens=prompt_tokens + event.completion_tokens,
-                    prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
-                        cached_tokens=event.cached_tokens,
-                    ),
-                    completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
-                        reasoning_tokens=reasoning_tokens,
-                    ),
-                )
-                yield _chunk(completion_id, created, DeltaMessage(content=""), finish_reason, usage)
+                    function = message["tool_calls"][0]["function"]
+                    tool_call = ChoiceDeltaToolCall(
+                        index=tool_calls,
+                        id=f"call_{uuid4()}",
+                        type="function",
+                        function=ChoiceDeltaToolCall.Function(
+                            name=function["name"],
+                            arguments=dumps(function["arguments"])
+                        )
+                    )
+                    tool_calls += 1
+                    yield _chunk(completion_id, created, DeltaMessage(tool_calls=[tool_call]))
+                case _EventKind.FINISHED:
+                    held_newlines = ""
+                    finish_reason = _finish_reason(
+                        completion_tokens=event.completion_tokens,
+                        max_output_tokens=max_output_tokens,
+                        tool_calls=tool_calls
+                    )
+                    usage = ChatCompletion.Usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=event.completion_tokens,
+                        total_tokens=prompt_tokens + event.completion_tokens,
+                        prompt_tokens_details=ChatCompletion.Usage.PromptTokensDetails(
+                            cached_tokens=event.cached_tokens,
+                        ),
+                        completion_tokens_details=ChatCompletion.Usage.CompletionTokensDetails(
+                            reasoning_tokens=reasoning_tokens,
+                        ),
+                    )
+                    yield _chunk(completion_id, created, DeltaMessage(content=""), finish_reason, usage)
+    finally:
+        # Release the engine request so it stops holding KV and a batch slot.
+        # Cancelling a request that already finished is a no-op.
+        manager.cancel_request(request_id=completion_id)
 
 def _create_token_stream(request_id: str) -> Iterator[_Event]:
     """
