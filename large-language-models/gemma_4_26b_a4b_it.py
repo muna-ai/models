@@ -7,7 +7,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "accelerate", "muna", "sglang==0.5.19", "tokenizers==0.22.2", "torch",
-#   "transformers==5.12.1"
+#   "transformers==5.15.0"
 # ]
 # ///
 
@@ -38,16 +38,15 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from time import time
 from tokenizers.decoders import DecodeStream
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer, BatchFeature
 from transformers.generation import ContinuousBatchingConfig, GenerationConfig
 from transformers.generation.continuous_batching import RequestStatus
-from typing import Annotated, Iterator
+from typing import Annotated, Iterator, Literal
 from uuid import uuid4
 
 # Load the Gemma 4 model
 CHECKPOINT = "nvidia/Gemma-4-26B-A4B-NVFP4"
 config = AutoConfig.from_pretrained(CHECKPOINT)
-tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
 with init_empty_weights():
     model = AutoModelForCausalLM.from_config(config)
 
@@ -57,6 +56,16 @@ draft_config = AutoConfig.from_pretrained(DRAFT_CHECKPOINT)
 with init_empty_weights():
     draft_model = AutoModelForCausalLM.from_config(draft_config)
 
+# Load the processor
+# The NVFP4 checkpoint ships no image processor config, so take it from the base model
+PROCESSOR_CHECKPOINT = "google/gemma-4-26B-A4B-it"
+tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
+processor = AutoProcessor.from_pretrained(
+    PROCESSOR_CHECKPOINT,
+    tokenizer=tokenizer,
+    chat_template=tokenizer.chat_template
+)
+
 # Resolve the reasoning and turn marker tokens.
 # Gemma 4 renders reasoning as a named channel, `<|channel>thought\n...<channel|>`,
 # and tool calls as `<|tool_call>call:NAME{...}<tool_call|>`.
@@ -65,6 +74,11 @@ THINK_CLOSE = tokenizer.convert_tokens_to_ids("<channel|>")
 TURN_CLOSE = tokenizer.convert_tokens_to_ids("<turn|>")
 TOOL_RESPONSE_OPEN = tokenizer.convert_tokens_to_ids("<|tool_response>")
 STOP_TOKENS = [tokenizer.eos_token_id, TURN_CLOSE, TOOL_RESPONSE_OPEN]
+
+# Engine limits. Shared by the inference metadata below and the request
+# pre-validation in the predictor.
+MAX_TOTAL_TOKENS = 262_144
+NUM_DRAFT_TOKENS = 16       # DFlash block size
 
 # Create the continuous batching manager
 generation_config = GenerationConfig(
@@ -86,25 +100,32 @@ manager = model.init_continuous_batching(
     continuous_batching_config=batching_config,
 )
 
-# Define a tokenization function
-# This function is both used for both inference and KV-aware routing
-def _tokenize(
+# Define a processing function
+# This function is used for both inference and KV-aware routing
+def _process(
     messages: list[Message],
-    tools: list[dict] | None = None
-) -> list[int]:
-    return tokenizer.apply_chat_template(
+    tools: list[dict] | None = None,
+    reasoning_effort: str | None = None
+) -> BatchFeature:
+    # Gemma 4 has a single thinking switch and no effort levels
+    enable_thinking = (
+        reasoning_effort is not None and
+        reasoning_effort not in ("none", "minimal")
+    )
+    prompt = processor.apply_chat_template(
         messages,
         tools=tools,
         add_generation_prompt=True,
-        tokenize=True,
-        return_dict=False,
+        tokenize=False,
+        enable_thinking=enable_thinking,
     )
+    return processor(text=prompt)
 
 @compile(
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
     sandbox=Sandbox()
         .pip_install("torch==2.13.0", "torchvision", index_url="https://download.pytorch.org/whl/cpu")
-        .pip_install("accelerate", "transformers==5.12.1", "tokenizers==0.22.2")
+        .pip_install("accelerate", "transformers==5.15.0", "tokenizers==0.22.2")
         # Parsers only: skip sglang's CUDA dependency tree, then add the pure
         # packages its import chain needs (measured on Linux).
         .pip_install("sglang==0.5.19", flags="--no-deps") # parsers only, skip CUDA dependency tree
@@ -120,17 +141,18 @@ def _tokenize(
             tensor_parallelism=1,
             speculative_decoding=SpeculativeDecodingConfig(
                 draft_model=draft_model,
-                num_draft_tokens=16,        # DFlash block size
+                num_draft_tokens=NUM_DRAFT_TOKENS,
             ),
-            max_running_requests=8,
-            max_total_tokens=131_072
+            max_running_requests=16,
+            max_total_tokens=MAX_TOTAL_TOKENS
         ),
-        KVRoutingMetadata(tokenize=_tokenize)
+        KVRoutingMetadata(tokenize=_process)
     ]
 )
 def gemma_4_26b_a4b_it(
-    messages: Annotated[list[Message], Parameter.Generic(
+    messages: Annotated[list[Message], Annotations.ChatMessages(
         description="Messages comprising the conversation so far.",
+        context_length=MAX_TOTAL_TOKENS,
         batch=BatchConfig(mode="continuous")
     )],
     *,
@@ -138,21 +160,33 @@ def gemma_4_26b_a4b_it(
         list[dict],
         Annotations.ChatTools(description="Tools the model may call.")
     ]=None,
+    reasoning_effort: Annotated[
+        Literal["none", "minimal", "low", "medium", "high", "xhigh"],
+        Annotations.ReasoningEffort(description="Model reasoning effort.")
+    ]=None,
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
         min=1,
-        max=32768
+        max=65_536
     )]=32768,
     temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0
-    )]=0.7,
+    )]=1.0,
     top_p: Annotated[float, Annotations.TopP(
         description="Nucleus sampling probability.",
         min=0.0,
         max=1.0
     )]=0.95,
+    top_k: Annotated[int, Annotations.TopK(
+        description="Only sample from the top K options for each token.",
+        min=1
+    )]=64,
+    seed: Annotated[
+        int,
+        Annotations.Seed(description="Seed for reproducible sampling.")
+    ]=None,
 ) -> Iterator[ChatCompletionChunk]:
     """
     Stream chat completions from Gemma 4 26B A4B (NVFP4).
@@ -160,7 +194,16 @@ def gemma_4_26b_a4b_it(
     # Submit the request to the shared batching manager. Other concurrent calls
     # to this predictor add their own requests in parallel; the manager merges
     # them all into the next forward step.
-    input_ids = _tokenize(messages, tools)
+    inputs = _process(messages, tools, reasoning_effort)
+    input_ids = inputs.input_ids[0]
+    # Check input token count
+    # Speculative steps need `NUM_DRAFT_TOKENS - 1` slots of slack past the
+    # last committed token, the same rule the scheduler applies at admission.
+    if len(input_ids) + NUM_DRAFT_TOKENS - 1 >= MAX_TOTAL_TOKENS:
+        raise ValueError(
+            f"The input ({len(input_ids)} tokens) is longer than the model's "
+            f"context length ({MAX_TOTAL_TOKENS} tokens)."
+        )
     completion_id = f"chatcmpl-{uuid4()}"
     created = int(time())
     prompt_tokens = len(input_ids)
@@ -171,11 +214,11 @@ def gemma_4_26b_a4b_it(
         max_new_tokens=max_output_tokens,
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
+        seed=seed,
     )
     # Stream the completion
     try:
-        # First chunk announces the assistant role with no content (match OpenAI protocol)
-        yield _chunk(completion_id, created, DeltaMessage(role="assistant", content=""))
         # Create parsers for reasoning and function calling
         decoder = DecodeStream(skip_special_tokens=False)
         reasoning = ReasoningParser(
@@ -193,11 +236,16 @@ def gemma_4_26b_a4b_it(
         held_newlines = ""
         trim_content = False
         error = ""
+        role_sent = False
         # Consume generated tokens
         for output in manager.request_id_iter(request_id=completion_id):
             if output.status == RequestStatus.FAILED:
                 error = output.error or "The request was aborted."
                 break
+            if not role_sent:
+                # First chunk announces the assistant role with no content (OpenAI protocol)
+                yield _chunk(completion_id, created, DeltaMessage(role="assistant", content=""))
+                role_sent = True
             finished = output.status == RequestStatus.FINISHED
             # Decode the new tokens and split the text into reasoning and normal text
             segments = []
@@ -319,10 +367,14 @@ def _chunk(
 def _starts_in_reasoning(input_ids: list[int]) -> bool:
     """
     The Gemma 4 template closes the generation prompt with an empty
-    `<|channel>thought\n<channel|>` block when thinking is disabled, and with
-    an open `<|channel>thought\n` when thinking is enabled after a tool
-    response (trailing text, so the *last* token is not the marker). Scan back
-    to the most recent marker instead of checking the final token.
+    `<|channel>thought\n<channel|>` block when thinking is disabled. With
+    thinking enabled it ends at `<|turn>model\n` and the model opens the
+    thought channel itself, which the reasoning parser detects from the
+    emitted `<|channel>thought\n` marker (no forcing needed). Forcing is only
+    right when the prompt itself ends inside an open channel, so scan back to
+    the most recent marker instead of checking the final token: a trailing
+    `<|channel>` forces reasoning, a trailing `<channel|>` or no marker at all
+    leaves detection to the parser.
     """
     for token in reversed(input_ids):
         if token == THINK_OPEN:

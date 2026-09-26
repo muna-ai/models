@@ -42,7 +42,7 @@ from torch.nn import Module
 from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
 from transformers.generation import ContinuousBatchingConfig, GenerationConfig
 from transformers.generation.continuous_batching import RequestStatus
-from typing import Annotated, Iterator
+from typing import Annotated, Iterator, Literal
 from uuid import uuid4
 
 # Load the Qwen 3.8 text backbone
@@ -77,6 +77,10 @@ THINK_OPEN = tokenizer.convert_tokens_to_ids("<think>")
 THINK_CLOSE = tokenizer.convert_tokens_to_ids("</think>")
 STOP_TOKENS = [tokenizer.eos_token_id]
 
+# Engine limits
+MAX_TOTAL_TOKENS = 262_144
+NUM_DRAFT_TOKENS = 8            # DFlash2 block size
+
 # Create the continuous batching manager
 generation_config = GenerationConfig(
     max_new_tokens=2048,
@@ -100,7 +104,8 @@ manager = model.init_continuous_batching(
 # This function is both used for both inference and KV-aware routing
 def _tokenize(
     messages: list[Message],
-    tools: list[dict] | None = None
+    tools: list[dict] | None = None,
+    reasoning_effort: str | None = None
 ) -> list[int]:
     # Convert `developer` prompt into `system` prompt
     prompt = [
@@ -108,6 +113,13 @@ def _tokenize(
         if message["role"] == "developer" else message
         for message in messages
     ]
+    # Map the OpenAI reasoning effort onto the template's thinking controls
+    enable_thinking = reasoning_effort not in ("none", "minimal")
+    template_effort = (
+        reasoning_effort
+        if reasoning_effort in ("low", "medium")
+        else "xhigh"
+    )
     # Tokenize
     return tokenizer.apply_chat_template(
         prompt,
@@ -115,6 +127,8 @@ def _tokenize(
         add_generation_prompt=True,
         tokenize=True,
         return_dict=False,
+        enable_thinking=enable_thinking,
+        reasoning_effort=template_effort,
     )
 
 @compile(
@@ -135,17 +149,18 @@ def _tokenize(
             tensor_parallelism=1,
             speculative_decoding=SpeculativeDecodingConfig(
                 draft_model=draft_model,
-                num_draft_tokens=8,         # DFlash2 block size
+                num_draft_tokens=NUM_DRAFT_TOKENS,
             ),
-            max_running_requests=4,
-            max_total_tokens=131_072
+            max_running_requests=16,
+            max_total_tokens=MAX_TOTAL_TOKENS
         ),
         KVRoutingMetadata(tokenize=_tokenize)
     ]
 )
 def qwen_3_8_27b(
-    messages: Annotated[list[Message], Parameter.Generic(
+    messages: Annotated[list[Message], Annotations.ChatMessages(
         description="Messages comprising the conversation so far.",
+        context_length=MAX_TOTAL_TOKENS,
         batch=BatchConfig(mode="continuous")
     )],
     *,
@@ -153,22 +168,47 @@ def qwen_3_8_27b(
         list[dict],
         Annotations.ChatTools(description="Tools the model may call.")
     ]=None,
+    reasoning_effort: Annotated[
+        Literal["none", "minimal", "low", "medium", "high", "xhigh"],
+        Annotations.ReasoningEffort(description="Model reasoning effort.")
+    ]=None,
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
         min=1,
-        max=32768
+        max=65_536
     )]=32768,
     temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0
-    )]=0.7,
+    )]=1.0,
+    top_p: Annotated[float, Annotations.TopP(
+        description="Nucleus sampling probability.",
+        min=0.0,
+        max=1.0
+    )]=0.95,
+    top_k: Annotated[int, Annotations.TopK(
+        description="Only sample from the top K options for each token.",
+        min=1
+    )]=20,
+    seed: Annotated[
+        int,
+        Annotations.Seed(description="Seed for reproducible sampling.")
+    ]=None,
 ) -> Iterator[ChatCompletionChunk]:
     """
     Stream chat completions from Qwen 3.8 27B (NVFP4).
     """
     # Submit the request to the shared batching manager
-    input_ids = _tokenize(messages, tools)
+    input_ids = _tokenize(messages, tools, reasoning_effort)
+    # Check input token count
+    # Speculative steps need `NUM_DRAFT_TOKENS - 1` slots of slack past the
+    # last committed token, the same rule the scheduler applies at admission.
+    if len(input_ids) + NUM_DRAFT_TOKENS - 1 >= MAX_TOTAL_TOKENS:
+        raise ValueError(
+            f"The input ({len(input_ids)} tokens) is longer than the model's "
+            f"context length ({MAX_TOTAL_TOKENS} tokens)."
+        )
     completion_id = f"chatcmpl-{uuid4()}"
     created = int(time())
     prompt_tokens = len(input_ids)
@@ -177,12 +217,13 @@ def qwen_3_8_27b(
         request_id=completion_id,
         streaming=True,
         max_new_tokens=max_output_tokens,
-        temperature=temperature
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed
     )
     # Stream the completion
     try:
-        # First chunk announces the assistant role with no content (match OpenAI protocol)
-        yield _chunk(completion_id, created, DeltaMessage(role="assistant", content=""))
         # Create parsers for reasoning and function calling
         decoder = DecodeStream(skip_special_tokens=False)
         reasoning = ReasoningParser(
@@ -200,11 +241,16 @@ def qwen_3_8_27b(
         held_newlines = ""
         trim_content = False
         error = ""
+        role_sent = False
         # Consume generated tokens
         for output in manager.request_id_iter(request_id=completion_id):
             if output.status == RequestStatus.FAILED:
                 error = output.error or "The request was aborted."
                 break
+            if not role_sent:
+                # First chunk announces the assistant role with no content (OpenAI protocol)
+                yield _chunk(completion_id, created, DeltaMessage(role="assistant", content=""))
+                role_sent = True
             finished = output.status == RequestStatus.FINISHED
             # Decode the new tokens and split the text into reasoning and normal text
             segments = []
