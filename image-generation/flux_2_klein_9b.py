@@ -14,7 +14,7 @@ from diffusers import (
     AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler,
     Flux2KleinPipeline, Flux2Transformer2DModel
 )
-from muna import compile, BatchConfig, Parameter, Sandbox
+from muna import compile, Parameter, Sandbox
 from muna.beta import Annotations, DiffusersToSGLangInferenceMetadata
 from os import environ
 from PIL import Image
@@ -59,7 +59,6 @@ pipe = Flux2KleinPipeline(
     tokenizer=tokenizer,
     scheduler=scheduler
 )
-MAX_BATCH_SIZE = 4
 MAX_NUM_IMAGES = 4
 
 @compile(
@@ -71,15 +70,15 @@ MAX_NUM_IMAGES = 4
         DiffusersToSGLangInferenceMetadata(
             pipeline=pipe,
             compute_architecture="sm_100", # Blackwell
-            max_batch_size=MAX_BATCH_SIZE * MAX_NUM_IMAGES
+            max_batch_size=MAX_NUM_IMAGES
         )
     ]
 )
 def flux_2_klein_9b(
-    prompt: Annotated[list[str], Parameter.Generic(
-        description="Text descriptions of the desired images.",
-        batch=BatchConfig(mode="dynamic", capacity=MAX_BATCH_SIZE)
-    )],
+    prompt: Annotated[
+        str,
+        Annotations.ImagePrompt(description="Text description of the desired image.")
+    ],
     *,
     width: Annotated[int, Annotations.ImageWidth(
         description="Generated image width in pixels.",
@@ -116,7 +115,7 @@ def flux_2_klein_9b(
     Parameter.Generic(description="Generated images.")
 ]:
     """
-    Generate images from text prompts with FLUX.2 [klein] 9B.
+    Generate images from a text prompt with FLUX.2 [klein] 9B.
     """
     generator = Generator(device="cuda").manual_seed(seed)
     output = pipe(

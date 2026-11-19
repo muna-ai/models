@@ -23,7 +23,7 @@
 from contextlib import contextmanager
 from huggingface_hub import hf_hub_download
 from muna import compile, Parameter, Sandbox
-from muna.beta import OnnxRuntimeInferenceMetadata
+from muna.beta import TorchToOnnxRuntimeInferenceMetadata
 from numpy import ndarray, uint8
 from pathlib import Path
 from PIL import Image
@@ -106,7 +106,7 @@ example_input = randn(1, 1, 3, INPUT_SIZE, INPUT_SIZE)
         .pip_install("addict", "einops", "huggingface_hub", "omegaconf", "opencv-python-headless",  "safetensors")
         .run_commands("git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git"),
     metadata=[
-        OnnxRuntimeInferenceMetadata(
+        TorchToOnnxRuntimeInferenceMetadata(
             model=model,
             model_args=[example_input],
             exporter="none",

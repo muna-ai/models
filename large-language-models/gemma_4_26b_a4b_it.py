@@ -33,6 +33,7 @@ from muna.beta.openai import (
     DeltaMessage, Message, StreamChoice
 )
 from os import environ
+from PIL import Image
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -104,6 +105,7 @@ manager = model.init_continuous_batching(
 # This function is used for both inference and KV-aware routing
 def _process(
     messages: list[Message],
+    images: list[Image.Image] | None = None,
     tools: list[dict] | None = None,
     reasoning_effort: str | None = None
 ) -> BatchFeature:
@@ -112,6 +114,7 @@ def _process(
         reasoning_effort is not None and
         reasoning_effort not in ("none", "minimal")
     )
+    # Render the prompt
     prompt = processor.apply_chat_template(
         messages,
         tools=tools,
@@ -119,7 +122,8 @@ def _process(
         tokenize=False,
         enable_thinking=enable_thinking,
     )
-    return processor(text=prompt)
+    # Tokenize
+    return processor(text=prompt, images=images)
 
 @compile(
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
@@ -156,6 +160,10 @@ def gemma_4_26b_a4b_it(
         batch=BatchConfig(mode="continuous")
     )],
     *,
+    images: Annotated[
+        list[Image.Image],
+        Annotations.ChatImages(description="Images referenced by the conversation.")
+    ]=None,
     tools: Annotated[
         list[dict],
         Annotations.ChatTools(description="Tools the model may call.")
@@ -194,7 +202,7 @@ def gemma_4_26b_a4b_it(
     # Submit the request to the shared batching manager. Other concurrent calls
     # to this predictor add their own requests in parallel; the manager merges
     # them all into the next forward step.
-    inputs = _process(messages, tools, reasoning_effort)
+    inputs = _process(messages, images, tools, reasoning_effort)
     input_ids = inputs.input_ids[0]
     # Check input token count
     # Speculative steps need `NUM_DRAFT_TOKENS - 1` slots of slack past the
@@ -216,6 +224,10 @@ def gemma_4_26b_a4b_it(
         top_p=top_p,
         top_k=top_k,
         seed=seed,
+        pixel_values=inputs.get("pixel_values"),
+        image_position_ids=inputs.get("image_position_ids"),
+        mm_token_type_ids=inputs.get("mm_token_type_ids"),
+        image_hashes=inputs.get("image_hashes"),
     )
     # Stream the completion
     try:
