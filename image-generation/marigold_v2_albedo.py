@@ -231,8 +231,6 @@ pipe = (
     else _create_pipeline()
 )
 
-MAX_NUM_IMAGES = 4
-
 @compile(
     targets=["x86_64-unknown-linux-gnu"],
     sandbox=Sandbox()
@@ -246,15 +244,15 @@ MAX_NUM_IMAGES = 4
     ]
 )
 def marigold_v2_albedo(
+    images: Annotated[
+        list[Image.Image],
+        Annotations.ChatImages(description="Input images. Marigold requires exactly one image.")
+    ],
+    *,
     prompt: Annotated[
         str,
         Annotations.ImagePrompt(description="Accepted for OpenAI Images compatibility (ignored).")
-    ],
-    images: Annotated[
-        list[Image.Image],
-        Parameter.Generic(description="Input images. Marigold requires exactly one image.")
-    ],
-    *,
+    ] = "",
     width: Annotated[int, Annotations.ImageWidth(
         description="Output width, or 0 to preserve the input width.",
         min=0,
@@ -268,7 +266,7 @@ def marigold_v2_albedo(
     num_images: Annotated[int, Annotations.ImageCount(
         description="Number of posterior samples per prompt.",
         min=1,
-        max=MAX_NUM_IMAGES
+        max=4
     )]=1,
     processing_resolution: Annotated[int, Parameter.Numeric(
         description="Maximum processing side (rounded up to a multiple of 16).",

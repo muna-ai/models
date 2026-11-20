@@ -179,38 +179,38 @@ def qwen_3_8_27b_uncensored(
     images: Annotated[
         list[Image.Image],
         Annotations.ChatImages(description="Images referenced by the conversation.")
-    ]=None,
+    ] = None,
     tools: Annotated[
         list[dict],
         Annotations.ChatTools(description="Tools the model may call.")
-    ]=None,
+    ] = None,
     reasoning_effort: Annotated[
         Literal["none", "minimal", "low", "medium", "high", "xhigh"],
         Annotations.ReasoningEffort(description="Model reasoning effort.")
-    ]=None,
+    ] = None,
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
         min=1,
         max=65_536
-    )]=32768,
+    )] = 32768,
     temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0
-    )]=1.0,
+    )] = 1.0,
     top_p: Annotated[float, Annotations.TopP(
         description="Nucleus sampling probability.",
         min=0.0,
         max=1.0
-    )]=0.95,
+    )] = 0.95,
     top_k: Annotated[int, Annotations.TopK(
         description="Only sample from the top K options for each token.",
         min=1
-    )]=20,
+    )] = 20,
     seed: Annotated[
         int,
         Annotations.Seed(description="Seed for reproducible sampling.")
-    ]=None,
+    ] = None,
 ) -> Iterator[ChatCompletionChunk]:
     """
     Stream chat completions from Qwen 3.8 27B Uncensored (NVFP4 + FP8).

@@ -21,33 +21,11 @@ from sentence_transformers.base.modules.transformer import Transformer
 from transformers import AutoModel
 from typing import Annotated, Literal
 
-@contextmanager
-def _empty_transformer_weights():
-    """
-    Have `sentence_transformers.models.Transformer` construct its backbone from
-    config on the meta device instead of downloading the safetensors shards.
-    """
-    def _load_model(
-        self, model_name_or_path, transformer_task, config,
-        backend, is_peft_model, **model_kwargs
-    ):
-        with init_empty_weights():
-            return AutoModel.from_config(config)
-    original = Transformer._load_model
-    Transformer._load_model = _load_model
-    try:
-        yield
-    finally:
-        Transformer._load_model = original
-
-# Load the Nomic Embed Text v1.5 model
-with _empty_transformer_weights():
-    model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", device="meta")
-    max_seq_length = model.max_seq_length
+# Load the model
+model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", device="meta")
+max_seq_length = model.max_seq_length
 
 @compile(
-    tag="@nomic/nomic-embed-text-v1.5",
-    access="public",
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
     sandbox=Sandbox()
         .pip_install("torch", index_url="https://download.pytorch.org/whl/cpu")
@@ -59,34 +37,28 @@ with _empty_transformer_weights():
     metadata=[
         TorchToSGLangInferenceMetadata(
             model=model,
-            compute_architecture="sm_100",  # Compile for Blackwell
+            compute_architecture="sm_100",  # Blackwell
         )
     ]
 )
 def nomic_embed_text_v1_5(
     texts: Annotated[list[str], Parameter.Generic(
         description="Input texts to embed.",
-        batch=BatchConfig(mode="dynamic", capacity=64)
+        batch=BatchConfig(mode="continuous")
     )],
     *,
     task: Annotated[
         Literal["search_query", "search_document", "clustering", "classification"],
         Parameter.Generic(description="Task instruction prefix.")
-    ]="search_document",
+    ] = "search_document",
     dimensions: Annotated[int, Annotations.EmbeddingDims(
         description="Embedding dimensions.",
         min=64,
         max=768
-    )]=768
+    )] = 768
 ) -> tuple[
-    Annotated[
-        ndarray,
-        Parameter.Embedding(description="Embedding matrix.")
-    ],
-    Annotated[
-        EmbeddingCreateResponse.Usage,
-        Parameter.Generic(description="Token usage.")
-    ]
+    Annotated[ndarray, Parameter.Embedding(description="Embedding matrix.")],
+    Annotated[EmbeddingCreateResponse.Usage, Parameter.Generic(description="Token usage.")]
 ]:
     """
     Embed text using Nomic Embed Text v1.5.

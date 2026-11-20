@@ -7,7 +7,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "accelerate", "muna", "sglang==0.5.19", "tokenizers==0.22.2", "torch",
-#   "transformers==5.12.1"
+#   "transformers==5.15.0"
 # ]
 # ///
 
@@ -33,13 +33,14 @@ from muna.beta.openai import (
     DeltaMessage, Message, StreamChoice
 )
 from os import environ
+from PIL import Image
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from time import time
 from tokenizers.decoders import DecodeStream
 from torch.nn import Module
-from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer, BatchFeature, Qwen3_5ForCausalLM
 from transformers.generation import ContinuousBatchingConfig, GenerationConfig
 from transformers.generation.continuous_batching import RequestStatus
 from typing import Annotated, Iterator, Literal
@@ -71,6 +72,15 @@ class DFlash2DraftStub(Module):
 
 draft_model = DFlash2DraftStub(draft_config)
 
+# Load the processor
+# The NVFP4 checkpoint ships no image processor config, so take it from the base model
+PROCESSOR_CHECKPOINT = "Qwen/Qwen3.8-27B"
+processor = AutoProcessor.from_pretrained(
+    PROCESSOR_CHECKPOINT,
+    tokenizer=tokenizer,
+    chat_template=tokenizer.chat_template
+)
+
 # Resolve the reasoning marker tokens. The Qwen 3.8 template ends the
 # generation prompt inside an open `<think>` block when thinking is enabled.
 THINK_OPEN = tokenizer.convert_tokens_to_ids("<think>")
@@ -100,13 +110,14 @@ manager = model.init_continuous_batching(
     continuous_batching_config=batching_config,
 )
 
-# Define a tokenization function
-# This function is both used for both inference and KV-aware routing
-def _tokenize(
+# Define a processing function
+# This function is used for both inference and KV-aware routing
+def _process(
     messages: list[Message],
+    images: list[Image.Image] | None = None,
     tools: list[dict] | None = None,
     reasoning_effort: str | None = None
-) -> list[int]:
+) -> BatchFeature:
     # Convert `developer` prompt into `system` prompt
     prompt = [
         { "role": "system", "content": message["content"] }
@@ -120,22 +131,23 @@ def _tokenize(
         if reasoning_effort in ("low", "medium")
         else "xhigh"
     )
-    # Tokenize
-    return tokenizer.apply_chat_template(
+    # Render the prompt
+    text = processor.apply_chat_template(
         prompt,
         tools=tools,
         add_generation_prompt=True,
-        tokenize=True,
-        return_dict=False,
+        tokenize=False,
         enable_thinking=enable_thinking,
         reasoning_effort=template_effort,
     )
+    # Tokenize
+    return processor(text=text, images=images)
 
 @compile(
     targets=["x86_64-unknown-linux-gnu"],   # Linux x64 + CUDA only
     sandbox=Sandbox()
         .pip_install("torch==2.13.0", "torchvision", index_url="https://download.pytorch.org/whl/cpu")
-        .pip_install("accelerate", "transformers==5.12.1", "tokenizers==0.22.2")
+        .pip_install("accelerate", "transformers==5.15.0", "tokenizers==0.22.2")
         .pip_install("sglang==0.5.19", flags="--no-deps") # parsers only, skip CUDA dependency tree
         .pip_install("aiohttp", "IPython", "openai", "orjson", "partial_json_parser", "pybase64",  "xgrammar")
         .env({
@@ -145,7 +157,7 @@ def _tokenize(
     metadata=[
         TorchToSGLangInferenceMetadata(
             model=model,
-            compute_architecture="sm_100",  # Compile for Blackwell
+            compute_architecture="sm_100",  # Blackwell
             tensor_parallelism=1,
             speculative_decoding=SpeculativeDecodingConfig(
                 draft_model=draft_model,
@@ -154,7 +166,7 @@ def _tokenize(
             max_running_requests=16,
             max_total_tokens=MAX_TOTAL_TOKENS
         ),
-        KVRoutingMetadata(tokenize=_tokenize)
+        KVRoutingMetadata(tokenize=_process)
     ]
 )
 def qwen_3_8_27b(
@@ -164,43 +176,48 @@ def qwen_3_8_27b(
         batch=BatchConfig(mode="continuous")
     )],
     *,
+    images: Annotated[
+        list[Image.Image],
+        Annotations.ChatImages(description="Images referenced by the conversation.")
+    ] = None,
     tools: Annotated[
         list[dict],
         Annotations.ChatTools(description="Tools the model may call.")
-    ]=None,
+    ] = None,
     reasoning_effort: Annotated[
         Literal["none", "minimal", "low", "medium", "high", "xhigh"],
         Annotations.ReasoningEffort(description="Model reasoning effort.")
-    ]=None,
+    ] = None,
     max_output_tokens: Annotated[int, Annotations.MaxOutputTokens(
         description="Maximum number of tokens in the response.",
         min=1,
         max=65_536
-    )]=32768,
+    )] = 32768,
     temperature: Annotated[float, Annotations.Temperature(
         description="Sampling temperature.",
         min=0.0,
         max=2.0
-    )]=1.0,
+    )] = 1.0,
     top_p: Annotated[float, Annotations.TopP(
         description="Nucleus sampling probability.",
         min=0.0,
         max=1.0
-    )]=0.95,
+    )] = 0.95,
     top_k: Annotated[int, Annotations.TopK(
         description="Only sample from the top K options for each token.",
         min=1
-    )]=20,
+    )] = 20,
     seed: Annotated[
         int,
         Annotations.Seed(description="Seed for reproducible sampling.")
-    ]=None,
+    ] = None,
 ) -> Iterator[ChatCompletionChunk]:
     """
     Stream chat completions from Qwen 3.8 27B (NVFP4).
     """
     # Submit the request to the shared batching manager
-    input_ids = _tokenize(messages, tools, reasoning_effort)
+    inputs = _process(messages, images, tools, reasoning_effort)
+    input_ids = inputs.input_ids[0]
     # Check input token count
     # Speculative steps need `NUM_DRAFT_TOKENS - 1` slots of slack past the
     # last committed token, the same rule the scheduler applies at admission.
@@ -220,7 +237,11 @@ def qwen_3_8_27b(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        seed=seed
+        seed=seed,
+        pixel_values=inputs.get("pixel_values"),
+        image_grid_thw=inputs.get("image_grid_thw"),
+        mm_token_type_ids=inputs.get("mm_token_type_ids"),
+        image_hashes=inputs.get("image_hashes"),
     )
     # Stream the completion
     try:

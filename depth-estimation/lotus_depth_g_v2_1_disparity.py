@@ -9,17 +9,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "muna",
-#     "accelerate==0.29.3",
-#     "diffusers==0.28.0",
-#     "huggingface_hub==0.22.2",
-#     "numpy==1.26.4",
-#     "peft==0.7.0",
-#     "pillow",
-#     "safetensors==0.8.0",
-#     "torch==2.10.0",
-#     "torchvision==0.25.0",
-#     "transformers==4.40.1"
+#     "muna", "accelerate==0.29.3", "diffusers==0.28.0", "huggingface_hub==0.22.2",
+#     "numpy==1.26.4", "peft==0.7.0", "pillow", "safetensors==0.8.0",
+#     "torch==2.10.0", "torchvision==0.25.0", "transformers==4.40.1"
 # ]
 # ///
 
@@ -186,7 +178,7 @@ pipe = (
 def lotus_depth_g_v2_1_disparity(
     images: Annotated[
         list[Image.Image],
-        Parameter.Generic(description="Input images. Lotus requires exactly one image.")
+        Annotations.ChatImages(description="Input images. Lotus requires exactly one image.")
     ],
     *,
     prompt: Annotated[
@@ -205,7 +197,7 @@ def lotus_depth_g_v2_1_disparity(
     )]=42
 ) -> Annotated[
     list[ndarray],
-    Parameter.DepthMap(description="FP32 relative disparity maps, each shaped (H,W) at input resolution; larger values are nearer.")
+    Parameter.DepthMap(description="Relative disparity maps. Larger values are nearer.")
 ]:
     """
     Estimate relative disparity from one RGB image with Lotus G v2.1.
