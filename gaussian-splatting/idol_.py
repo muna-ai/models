@@ -17,7 +17,7 @@
 from idol import IdolPipeline
 from io import BytesIO
 from muna import compile, Parameter, Sandbox
-from muna.beta import Annotations
+from muna.beta import Annotations, DiffusersToSGLangInferenceMetadata
 from os import environ
 from PIL import Image
 from typing import Annotated
@@ -32,7 +32,13 @@ pipe = IdolPipeline.from_pretrained("speridlabs/idol", device="cpu")
             "diffusers==0.38.0",
             "idol @ git+https://github.com/speridlabs/idol-sdk.git@4702a7f00850e34b6e83a2170cc123c3e9570744"
         )
-        .env({ "HF_TOKEN": environ.get("HF_TOKEN") })
+        .env({ "HF_TOKEN": environ.get("HF_TOKEN") }),
+    metadata=[
+        DiffusersToSGLangInferenceMetadata(
+            pipeline=pipe,
+            compute_architecture="sm_100"
+        )
+    ],
 )
 def idol_real(
     images: Annotated[
